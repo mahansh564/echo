@@ -14,7 +14,12 @@ pub async fn start_voice_cmd(
     terminal: tauri::State<'_, TerminalManager>,
 ) -> Result<VoiceStatus, String> {
     voice
-        .start(&app, config.inner(), db.inner().clone(), terminal.inner().clone())
+        .start(
+            &app,
+            config.inner(),
+            db.inner().clone(),
+            terminal.inner().clone(),
+        )
         .map_err(|e| e.to_string())
 }
 
@@ -27,7 +32,9 @@ pub async fn stop_voice_cmd(
 }
 
 #[tauri::command]
-pub async fn voice_status_cmd(voice: tauri::State<'_, VoiceManager>) -> Result<VoiceStatus, String> {
+pub async fn voice_status_cmd(
+    voice: tauri::State<'_, VoiceManager>,
+) -> Result<VoiceStatus, String> {
     Ok(voice.status())
 }
 

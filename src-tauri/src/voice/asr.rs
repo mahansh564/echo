@@ -10,13 +10,15 @@ struct WhisperJsonResponse {
 
 pub async fn transcribe_wav(config: &EchoConfig, wav_bytes: Vec<u8>) -> Result<String> {
     match config.asr_backend.to_lowercase().as_str() {
-        "http" => transcribe_via_http(
-            &config.asr_endpoint,
-            &config.asr_language,
-            config.asr_timeout_ms,
-            wav_bytes,
-        )
-        .await,
+        "http" => {
+            transcribe_via_http(
+                &config.asr_endpoint,
+                &config.asr_language,
+                config.asr_timeout_ms,
+                wav_bytes,
+            )
+            .await
+        }
         _ => transcribe_via_sidecar(config, wav_bytes).await,
     }
 }
@@ -66,12 +68,14 @@ async fn transcribe_via_sidecar(config: &EchoConfig, wav_bytes: Vec<u8>) -> Resu
     .map_err(|e| anyhow!("sidecar task join error: {}", e))?
 }
 
-fn run_sidecar(sidecar_path: &str, model_path: &str, language: &str, wav_bytes: Vec<u8>) -> Result<String> {
+fn run_sidecar(
+    sidecar_path: &str,
+    model_path: &str,
+    language: &str,
+    wav_bytes: Vec<u8>,
+) -> Result<String> {
     if sidecar_path.contains('/') && !Path::new(sidecar_path).exists() {
-        return Err(anyhow!(
-            "ASR sidecar binary missing at {}",
-            sidecar_path
-        ));
+        return Err(anyhow!("ASR sidecar binary missing at {}", sidecar_path));
     }
     if !Path::new(model_path).exists() {
         return Err(anyhow!("ASR model missing at {}", model_path));

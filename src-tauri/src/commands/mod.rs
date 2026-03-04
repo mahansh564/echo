@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod alerts;
 pub mod tasks;
 pub mod terminal;
 pub mod voice;

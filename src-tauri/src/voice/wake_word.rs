@@ -23,7 +23,8 @@ pub fn extract_command_after_wake(transcript: &str, wake_phrase: &str) -> Option
     let wake_lower = wake_phrase.to_lowercase();
     let idx = lowered.find(&wake_lower)?;
     let tail_start = idx.saturating_add(wake_phrase.len()).min(transcript.len());
-    let tail = transcript[tail_start..].trim_matches(|c: char| c.is_whitespace() || c == ',' || c == '.');
+    let tail =
+        transcript[tail_start..].trim_matches(|c: char| c.is_whitespace() || c == ',' || c == '.');
     if tail.is_empty() {
         None
     } else {
@@ -35,7 +36,13 @@ fn normalize(input: &str) -> String {
     input
         .to_lowercase()
         .chars()
-        .map(|ch| if ch.is_alphanumeric() || ch.is_whitespace() { ch } else { ' ' })
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch.is_whitespace() {
+                ch
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()

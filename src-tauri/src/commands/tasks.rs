@@ -2,9 +2,7 @@ use crate::commands::emit_task_updated;
 use crate::db::{models::Task, Db};
 
 pub async fn create_task(db: &Db, title: String, state: Option<String>) -> anyhow::Result<Task> {
-    let task = db
-        .create_task(&title, state.as_deref())
-        .await?;
+    let task = db.create_task(&title, state.as_deref()).await?;
     Ok(task)
 }
 
@@ -42,7 +40,9 @@ pub async fn create_task_cmd(
     title: String,
     state: Option<String>,
 ) -> Result<Task, String> {
-    let task = create_task(&db, title, state).await.map_err(|e| e.to_string())?;
+    let task = create_task(&db, title, state)
+        .await
+        .map_err(|e| e.to_string())?;
     let _ = emit_task_updated(&app, task.id);
     Ok(task)
 }
@@ -55,7 +55,9 @@ pub async fn update_task_cmd(
     title: Option<String>,
     state: Option<String>,
 ) -> Result<Task, String> {
-    let task = update_task(&db, id, title, state).await.map_err(|e| e.to_string())?;
+    let task = update_task(&db, id, title, state)
+        .await
+        .map_err(|e| e.to_string())?;
     let _ = emit_task_updated(&app, task.id);
     Ok(task)
 }
@@ -78,7 +80,9 @@ pub async fn move_task_state_cmd(
     id: i64,
     state: String,
 ) -> Result<Task, String> {
-    let task = move_task_state(&db, id, state).await.map_err(|e| e.to_string())?;
+    let task = move_task_state(&db, id, state)
+        .await
+        .map_err(|e| e.to_string())?;
     let _ = emit_task_updated(&app, task.id);
     Ok(task)
 }
@@ -104,8 +108,12 @@ mod tests {
     #[tokio::test]
     async fn list_tasks_command() {
         let db = Db::connect("sqlite::memory:").await.expect("db");
-        let _ = create_task(&db, "First".to_string(), None).await.expect("task");
-        let _ = create_task(&db, "Second".to_string(), None).await.expect("task");
+        let _ = create_task(&db, "First".to_string(), None)
+            .await
+            .expect("task");
+        let _ = create_task(&db, "Second".to_string(), None)
+            .await
+            .expect("task");
         let tasks = list_tasks(&db).await.expect("list");
         assert!(tasks.len() >= 2);
     }

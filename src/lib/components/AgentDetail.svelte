@@ -4,6 +4,14 @@
         id: number;
         name: string;
         state: string;
+        provider: string;
+        attentionState: string;
+        unresolvedAlertCount: number;
+        activeSessionStatus?: string | null;
+        activeSessionNeedsInput?: boolean | null;
+        activeSessionInputReason?: string | null;
+        taskTitle?: string | null;
+        lastActivityAt?: string | null;
         taskId?: number | null;
         lastSnippet?: string | null;
         updatedAt: string;
@@ -39,12 +47,16 @@
 
     <div class="meta">
       <div>
-        <p class="label">Assigned task</p>
-        <p class="value">{task?.title ?? "No task assigned"}</p>
+        <p class="label">Provider</p>
+        <p class="value">{agent.provider}</p>
       </div>
       <div>
-        <p class="label">Last update</p>
-        <p class="value">{agent.updatedAt}</p>
+        <p class="label">Assigned task</p>
+        <p class="value">{agent.taskTitle ?? task?.title ?? "No task assigned"}</p>
+      </div>
+      <div>
+        <p class="label">Last activity</p>
+        <p class="value">{agent.lastActivityAt ?? agent.updatedAt}</p>
       </div>
       <div>
         <p class="label">Linked session</p>
@@ -56,6 +68,24 @@
           {/if}
         </p>
       </div>
+      <div>
+        <p class="label">Attention state</p>
+        <p class="value attention {agent.attentionState}">
+          {agent.activeSessionNeedsInput || agent.unresolvedAlertCount > 0
+            ? "needs_input"
+            : agent.attentionState}
+          {#if agent.unresolvedAlertCount > 0}
+            ({agent.unresolvedAlertCount} open)
+          {/if}
+        </p>
+      </div>
+      <div>
+        <p class="label">Input reason</p>
+        <p class="value">
+          {agent.activeSessionInputReason ??
+            (agent.activeSessionNeedsInput ? "Session flagged for operator input" : "None")}
+        </p>
+      </div>
     </div>
 
     <div class="terminal">
@@ -65,7 +95,9 @@
       </pre>
       <div class="terminal-actions">
         <button class="ghost">Attach task</button>
-        <button class="primary" disabled={!canOpenSession} on:click={() => onOpenSession?.()}>Open session</button>
+        <button class="primary" disabled={!canOpenSession} on:click={() => onOpenSession?.()}>
+          {linkedSession ? "Attach terminal" : "Open session"}
+        </button>
       </div>
     </div>
   {:else}
@@ -145,6 +177,11 @@
   .value {
     margin: 0;
     font-size: 16px;
+  }
+
+  .value.attention.needs_input,
+  .value.attention.blocked {
+    color: #ffd166;
   }
 
   .terminal {

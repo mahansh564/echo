@@ -1,7 +1,7 @@
 pub mod models;
 
 use anyhow::Result;
-use models::{ManagedSession, SessionEvent, Task};
+use models::{AgentRow, ManagedSession, SessionAlert, SessionEvent, Task};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::str::FromStr;
@@ -10,6 +10,10 @@ use std::str::FromStr;
 pub struct Db {
     pool: SqlitePool,
 }
+
+const AGENT_SELECT_COLUMNS: &str = "id, name, state, provider, display_order, attention_state, task_id, active_session_id, last_snippet, last_input_required_at, updated_at";
+const MANAGED_SESSION_SELECT_COLUMNS: &str = "id, provider, status, launch_command, launch_args_json, cwd, pid, agent_id, task_id, last_heartbeat_at, started_at, ended_at, needs_input, input_reason, last_activity_at, transport, attach_count, failure_reason, metadata_json, created_at, updated_at";
+const SESSION_ALERT_SELECT_COLUMNS: &str = "id, session_id, agent_id, severity, reason, message, requires_ack, acknowledged_at, resolved_at, created_at, updated_at";
 
 impl Db {
     pub async fn connect(database_url: &str) -> Result<Self> {
@@ -89,21 +93,28 @@ impl Db {
     pub async fn create_agent(
         &self,
         name: &str,
+        provider: Option<&str>,
         state: Option<&str>,
         task_id: Option<i64>,
     ) -> Result<models::Agent> {
         let mut conn = self.pool.acquire().await?;
         let state_value = state.unwrap_or("idle");
-        sqlx::query("INSERT INTO agents (name, state, task_id) VALUES (?, ?, ?)")
+        let provider_value = provider.unwrap_or("opencode");
+        sqlx::query("INSERT INTO agents (name, provider, state, task_id) VALUES (?, ?, ?, ?)")
             .bind(name)
+            .bind(provider_value)
             .bind(state_value)
             .bind(task_id)
             .execute(&mut *conn)
             .await?;
+        sqlx::query("UPDATE agents SET display_order = id WHERE id = last_insert_rowid()")
+            .execute(&mut *conn)
+            .await?;
 
-        let agent = sqlx::query_as::<_, models::Agent>(
-            "SELECT id, name, state, task_id, last_snippet, updated_at FROM agents WHERE id = last_insert_rowid()",
-        )
+        let agent = sqlx::query_as::<_, models::Agent>(&format!(
+            "SELECT {} FROM agents WHERE id = last_insert_rowid()",
+            AGENT_SELECT_COLUMNS
+        ))
         .fetch_one(&mut *conn)
         .await?;
 
@@ -121,9 +132,10 @@ impl Db {
             .execute(&self.pool)
             .await?;
 
-        let agent = sqlx::query_as::<_, models::Agent>(
-            "SELECT id, name, state, task_id, last_snippet, updated_at FROM agents WHERE id = ?",
-        )
+        let agent = sqlx::query_as::<_, models::Agent>(&format!(
+            "SELECT {} FROM agents WHERE id = ?",
+            AGENT_SELECT_COLUMNS
+        ))
         .bind(agent_id)
         .fetch_one(&self.pool)
         .await?;
@@ -140,20 +152,80 @@ impl Db {
     }
 
     pub async fn list_agents(&self) -> Result<Vec<models::Agent>> {
-        let agents = sqlx::query_as::<_, models::Agent>(
-            "SELECT id, name, state, task_id, last_snippet, updated_at FROM agents ORDER BY updated_at DESC",
-        )
+        let agents = sqlx::query_as::<_, models::Agent>(&format!(
+            "SELECT {} FROM agents ORDER BY display_order ASC, updated_at DESC",
+            AGENT_SELECT_COLUMNS
+        ))
         .fetch_all(&self.pool)
         .await?;
         Ok(agents)
     }
 
+    pub async fn list_agent_rows(&self, limit: Option<i64>) -> Result<Vec<AgentRow>> {
+        let max = limit.unwrap_or(100);
+        let rows = sqlx::query_as::<_, AgentRow>(
+            "WITH latest_session AS (
+                SELECT
+                    ms.id,
+                    ms.agent_id,
+                    ms.status,
+                    ms.needs_input,
+                    ms.input_reason,
+                    ms.last_activity_at,
+                    ms.last_heartbeat_at,
+                    ms.updated_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ms.agent_id
+                        ORDER BY ms.updated_at DESC, ms.id DESC
+                    ) AS rn
+                FROM managed_sessions ms
+                WHERE ms.agent_id IS NOT NULL
+                  AND ms.status IN ('waking', 'active', 'stalled', 'needs_input')
+            ),
+            open_alert_counts AS (
+                SELECT sa.agent_id, COUNT(*) AS unresolved_alert_count
+                FROM session_alerts sa
+                WHERE sa.resolved_at IS NULL
+                GROUP BY sa.agent_id
+            )
+            SELECT
+                a.id AS agent_id,
+                a.name AS agent_name,
+                a.state AS agent_state,
+                a.provider,
+                a.display_order,
+                a.attention_state,
+                a.task_id,
+                t.title AS task_title,
+                COALESCE(a.active_session_id, ls.id) AS active_session_id,
+                ls.status AS active_session_status,
+                ls.needs_input AS active_session_needs_input,
+                ls.input_reason AS active_session_input_reason,
+                COALESCE(ls.last_activity_at, ls.last_heartbeat_at, ls.updated_at) AS last_activity_at,
+                a.last_snippet,
+                COALESCE(oac.unresolved_alert_count, 0) AS unresolved_alert_count,
+                a.updated_at
+            FROM agents a
+            LEFT JOIN tasks t ON t.id = a.task_id
+            LEFT JOIN latest_session ls ON ls.agent_id = a.id AND ls.rn = 1
+            LEFT JOIN open_alert_counts oac ON oac.agent_id = a.id
+            ORDER BY a.display_order ASC, a.updated_at DESC
+            LIMIT ?",
+        )
+        .bind(max)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     pub async fn update_agent_snippet(&self, agent_id: i64, snippet: &str) -> Result<()> {
-        sqlx::query("UPDATE agents SET last_snippet = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-            .bind(snippet)
-            .bind(agent_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE agents SET last_snippet = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(snippet)
+        .bind(agent_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -181,11 +253,22 @@ impl Db {
         .execute(&mut *conn)
         .await?;
 
-        let session = sqlx::query_as::<_, ManagedSession>(
-            "SELECT id, provider, status, launch_command, launch_args_json, cwd, pid, agent_id, task_id, last_heartbeat_at, started_at, ended_at, failure_reason, metadata_json, created_at, updated_at FROM managed_sessions WHERE id = last_insert_rowid()",
-        )
+        let session = sqlx::query_as::<_, ManagedSession>(&format!(
+            "SELECT {} FROM managed_sessions WHERE id = last_insert_rowid()",
+            MANAGED_SESSION_SELECT_COLUMNS
+        ))
         .fetch_one(&mut *conn)
         .await?;
+
+        if let Some(agent_id) = agent_id {
+            sqlx::query(
+                "UPDATE agents SET active_session_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+            .bind(session.id)
+            .bind(agent_id)
+            .execute(&mut *conn)
+            .await?;
+        }
 
         Ok(session)
     }
@@ -197,7 +280,7 @@ impl Db {
         failure_reason: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
-            "UPDATE managed_sessions SET status = ?, failure_reason = ?, started_at = CASE WHEN ? = 'active' AND started_at IS NULL THEN CURRENT_TIMESTAMP ELSE started_at END, ended_at = CASE WHEN ? IN ('ended', 'failed') THEN CURRENT_TIMESTAMP ELSE ended_at END, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE managed_sessions SET status = ?, failure_reason = ?, started_at = CASE WHEN ? = 'active' AND started_at IS NULL THEN CURRENT_TIMESTAMP ELSE started_at END, ended_at = CASE WHEN ? IN ('ended', 'failed') THEN CURRENT_TIMESTAMP ELSE ended_at END, last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(status)
         .bind(failure_reason)
@@ -211,7 +294,7 @@ impl Db {
 
     pub async fn update_session_heartbeat(&self, session_id: i64) -> Result<()> {
         sqlx::query(
-            "UPDATE managed_sessions SET last_heartbeat_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE managed_sessions SET last_heartbeat_at = CURRENT_TIMESTAMP, last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(session_id)
         .execute(&self.pool)
@@ -237,22 +320,28 @@ impl Db {
     }
 
     pub async fn set_session_pid(&self, session_id: i64, pid: Option<i64>) -> Result<()> {
-        sqlx::query("UPDATE managed_sessions SET pid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-            .bind(pid)
-            .bind(session_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE managed_sessions SET pid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(pid)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     pub async fn end_session(&self, session_id: i64, reason: Option<&str>) -> Result<()> {
         sqlx::query(
-            "UPDATE managed_sessions SET status = 'ended', failure_reason = ?, ended_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE managed_sessions SET status = 'ended', failure_reason = ?, ended_at = CURRENT_TIMESTAMP, needs_input = 0, input_reason = NULL, last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(reason)
         .bind(session_id)
         .execute(&self.pool)
         .await?;
+        sqlx::query("UPDATE agents SET active_session_id = NULL WHERE active_session_id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -263,17 +352,19 @@ impl Db {
     ) -> Result<Vec<ManagedSession>> {
         let max = limit.unwrap_or(50);
         let sessions = if let Some(status) = status {
-            sqlx::query_as::<_, ManagedSession>(
-                "SELECT id, provider, status, launch_command, launch_args_json, cwd, pid, agent_id, task_id, last_heartbeat_at, started_at, ended_at, failure_reason, metadata_json, created_at, updated_at FROM managed_sessions WHERE status = ? ORDER BY updated_at DESC LIMIT ?",
-            )
+            sqlx::query_as::<_, ManagedSession>(&format!(
+                "SELECT {} FROM managed_sessions WHERE status = ? ORDER BY updated_at DESC LIMIT ?",
+                MANAGED_SESSION_SELECT_COLUMNS
+            ))
             .bind(status)
             .bind(max)
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query_as::<_, ManagedSession>(
-                "SELECT id, provider, status, launch_command, launch_args_json, cwd, pid, agent_id, task_id, last_heartbeat_at, started_at, ended_at, failure_reason, metadata_json, created_at, updated_at FROM managed_sessions ORDER BY updated_at DESC LIMIT ?",
-            )
+            sqlx::query_as::<_, ManagedSession>(&format!(
+                "SELECT {} FROM managed_sessions ORDER BY updated_at DESC LIMIT ?",
+                MANAGED_SESSION_SELECT_COLUMNS
+            ))
             .bind(max)
             .fetch_all(&self.pool)
             .await?
@@ -282,9 +373,10 @@ impl Db {
     }
 
     pub async fn get_managed_session(&self, session_id: i64) -> Result<ManagedSession> {
-        let session = sqlx::query_as::<_, ManagedSession>(
-            "SELECT id, provider, status, launch_command, launch_args_json, cwd, pid, agent_id, task_id, last_heartbeat_at, started_at, ended_at, failure_reason, metadata_json, created_at, updated_at FROM managed_sessions WHERE id = ?",
-        )
+        let session = sqlx::query_as::<_, ManagedSession>(&format!(
+            "SELECT {} FROM managed_sessions WHERE id = ?",
+            MANAGED_SESSION_SELECT_COLUMNS
+        ))
         .bind(session_id)
         .fetch_one(&self.pool)
         .await?;
@@ -317,6 +409,106 @@ impl Db {
         Ok(event)
     }
 
+    pub async fn create_session_alert(
+        &self,
+        session_id: i64,
+        agent_id: Option<i64>,
+        severity: &str,
+        reason: &str,
+        message: &str,
+        requires_ack: bool,
+    ) -> Result<SessionAlert> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "INSERT INTO session_alerts (session_id, agent_id, severity, reason, message, requires_ack) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind(agent_id)
+        .bind(severity)
+        .bind(reason)
+        .bind(message)
+        .bind(requires_ack)
+        .execute(&mut *conn)
+        .await?;
+
+        if let Some(agent_id) = agent_id {
+            sqlx::query(
+                "UPDATE agents SET attention_state = 'needs_input', last_input_required_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+            .bind(agent_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+
+        let alert = sqlx::query_as::<_, SessionAlert>(&format!(
+            "SELECT {} FROM session_alerts WHERE id = last_insert_rowid()",
+            SESSION_ALERT_SELECT_COLUMNS
+        ))
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(alert)
+    }
+
+    pub async fn get_session_alert(&self, alert_id: i64) -> Result<SessionAlert> {
+        let alert = sqlx::query_as::<_, SessionAlert>(&format!(
+            "SELECT {} FROM session_alerts WHERE id = ?",
+            SESSION_ALERT_SELECT_COLUMNS
+        ))
+        .bind(alert_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(alert)
+    }
+
+    pub async fn acknowledge_session_alert(&self, alert_id: i64) -> Result<SessionAlert> {
+        sqlx::query(
+            "UPDATE session_alerts SET acknowledged_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(alert_id)
+        .execute(&self.pool)
+        .await?;
+        self.get_session_alert(alert_id).await
+    }
+
+    pub async fn resolve_session_alert(&self, alert_id: i64) -> Result<SessionAlert> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "UPDATE session_alerts SET resolved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(alert_id)
+        .execute(&mut *conn)
+        .await?;
+
+        let alert = sqlx::query_as::<_, SessionAlert>(&format!(
+            "SELECT {} FROM session_alerts WHERE id = ?",
+            SESSION_ALERT_SELECT_COLUMNS
+        ))
+        .bind(alert_id)
+        .fetch_one(&mut *conn)
+        .await?;
+
+        if let Some(agent_id) = alert.agent_id {
+            sqlx::query(
+                "UPDATE agents
+                 SET attention_state = CASE
+                     WHEN EXISTS (
+                        SELECT 1 FROM session_alerts
+                        WHERE agent_id = ? AND resolved_at IS NULL
+                     ) THEN attention_state
+                     ELSE 'ok'
+                 END,
+                 updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?",
+            )
+            .bind(agent_id)
+            .bind(agent_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+
+        Ok(alert)
+    }
+
     pub async fn list_session_events(
         &self,
         session_id: i64,
@@ -331,6 +523,64 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
         Ok(events)
+    }
+
+    pub async fn list_unresolved_session_alerts(
+        &self,
+        agent_id: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<Vec<SessionAlert>> {
+        self.list_session_alerts(agent_id, true, limit).await
+    }
+
+    pub async fn list_session_alerts(
+        &self,
+        agent_id: Option<i64>,
+        unresolved_only: bool,
+        limit: Option<i64>,
+    ) -> Result<Vec<SessionAlert>> {
+        let max = limit.unwrap_or(100);
+        let alerts = match (agent_id, unresolved_only) {
+            (Some(agent_id), true) => {
+                sqlx::query_as::<_, SessionAlert>(&format!(
+                    "SELECT {} FROM session_alerts WHERE resolved_at IS NULL AND agent_id = ? ORDER BY created_at DESC LIMIT ?",
+                    SESSION_ALERT_SELECT_COLUMNS
+                ))
+                .bind(agent_id)
+                .bind(max)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(agent_id), false) => {
+                sqlx::query_as::<_, SessionAlert>(&format!(
+                    "SELECT {} FROM session_alerts WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
+                    SESSION_ALERT_SELECT_COLUMNS
+                ))
+                .bind(agent_id)
+                .bind(max)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, true) => {
+                sqlx::query_as::<_, SessionAlert>(&format!(
+                    "SELECT {} FROM session_alerts WHERE resolved_at IS NULL ORDER BY created_at DESC LIMIT ?",
+                    SESSION_ALERT_SELECT_COLUMNS
+                ))
+                .bind(max)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, false) => {
+                sqlx::query_as::<_, SessionAlert>(&format!(
+                    "SELECT {} FROM session_alerts ORDER BY created_at DESC LIMIT ?",
+                    SESSION_ALERT_SELECT_COLUMNS
+                ))
+                .bind(max)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(alerts)
     }
 
     pub async fn upsert_linear_issue(
@@ -353,11 +603,12 @@ impl Db {
     }
 
     pub async fn get_linear_issue(&self, id: &str) -> Result<(String, String)> {
-        let row =
-            sqlx::query_as::<_, (String, String)>("SELECT id, title FROM linear_issues WHERE id = ?")
-                .bind(id)
-                .fetch_one(&self.pool)
-                .await?;
+        let row = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, title FROM linear_issues WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(row)
     }
 }

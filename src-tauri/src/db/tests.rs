@@ -1,4 +1,7 @@
 use super::*;
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{Connection, Executor};
+use std::str::FromStr;
 
 async fn setup_test_db() -> Db {
     Db::connect("sqlite::memory:").await.expect("db init")
@@ -24,7 +27,13 @@ async fn list_tasks_returns_created() {
 #[tokio::test]
 async fn list_agents_returns_created() {
     let db = setup_test_db().await;
-    let _ = db.create_agent("Agent One", None, None).await.unwrap();
+    let created = db
+        .create_agent("Agent One", Some("opencode"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(created.provider, "opencode");
+    assert_eq!(created.attention_state, "ok");
+    assert_eq!(created.display_order, created.id);
     let agents = db.list_agents().await.unwrap();
     assert!(agents.len() >= 1);
 }
@@ -32,7 +41,10 @@ async fn list_agents_returns_created() {
 #[tokio::test]
 async fn update_agent_snippet_persists() {
     let db = setup_test_db().await;
-    let agent = db.create_agent("Agent Snip", None, None).await.unwrap();
+    let agent = db
+        .create_agent("Agent Snip", Some("opencode"), None, None)
+        .await
+        .unwrap();
     db.update_agent_snippet(agent.id, "hello").await.unwrap();
     let agents = db.list_agents().await.unwrap();
     let found = agents.iter().find(|a| a.id == agent.id).unwrap();
@@ -43,20 +55,14 @@ async fn update_agent_snippet_persists() {
 async fn managed_session_lifecycle_persists() {
     let db = setup_test_db().await;
     let session = db
-        .create_managed_session(
-            "opencode",
-            "opencode",
-            "[]",
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_managed_session("opencode", "opencode", "[]", None, None, None, None)
         .await
         .unwrap();
     assert_eq!(session.status, "waking");
 
-    db.update_session_status(session.id, "active", None).await.unwrap();
+    db.update_session_status(session.id, "active", None)
+        .await
+        .unwrap();
     db.update_session_heartbeat(session.id).await.unwrap();
     db.insert_session_event(session.id, "spawned", Some("ok"), None)
         .await
@@ -64,7 +70,176 @@ async fn managed_session_lifecycle_persists() {
 
     let stored = db.get_managed_session(session.id).await.unwrap();
     assert_eq!(stored.status, "active");
+    assert!(!stored.needs_input);
+    assert_eq!(stored.transport, "pty");
 
     let events = db.list_session_events(session.id, Some(10)).await.unwrap();
     assert!(!events.is_empty());
+}
+
+#[tokio::test]
+async fn list_agent_rows_includes_runtime_session_summary() {
+    let db = setup_test_db().await;
+    let task = db
+        .create_task("Investigate flaky test", None)
+        .await
+        .unwrap();
+    let agent = db
+        .create_agent(
+            "Agent Runtime",
+            Some("opencode"),
+            Some("running"),
+            Some(task.id),
+        )
+        .await
+        .unwrap();
+    let session = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            Some(task.id),
+            None,
+        )
+        .await
+        .unwrap();
+    db.update_session_status(session.id, "active", None)
+        .await
+        .unwrap();
+
+    let rows = db.list_agent_rows(Some(10)).await.unwrap();
+    let row = rows.iter().find(|row| row.agent_id == agent.id).unwrap();
+    assert_eq!(row.agent_name, "Agent Runtime");
+    assert_eq!(row.task_title.as_deref(), Some("Investigate flaky test"));
+    assert_eq!(row.active_session_id, Some(session.id));
+    assert_eq!(row.active_session_status.as_deref(), Some("active"));
+}
+
+#[tokio::test]
+async fn session_alert_ack_and_resolve_flow() {
+    let db = setup_test_db().await;
+    let agent = db
+        .create_agent("Agent Alerts", Some("opencode"), None, None)
+        .await
+        .unwrap();
+    let session = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let alert = db
+        .create_session_alert(
+            session.id,
+            Some(agent.id),
+            "warning",
+            "input_prompt",
+            "Agent requested confirmation to continue",
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(alert.requires_ack);
+    assert!(alert.acknowledged_at.is_none());
+    assert!(alert.resolved_at.is_none());
+
+    let unresolved = db
+        .list_unresolved_session_alerts(Some(agent.id), Some(10))
+        .await
+        .unwrap();
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0].id, alert.id);
+
+    let acknowledged = db.acknowledge_session_alert(alert.id).await.unwrap();
+    assert!(acknowledged.acknowledged_at.is_some());
+    assert!(acknowledged.resolved_at.is_none());
+
+    let resolved = db.resolve_session_alert(alert.id).await.unwrap();
+    assert!(resolved.resolved_at.is_some());
+
+    let unresolved_after = db
+        .list_unresolved_session_alerts(Some(agent.id), Some(10))
+        .await
+        .unwrap();
+    assert!(unresolved_after.is_empty());
+
+    let agents = db.list_agents().await.unwrap();
+    let stored_agent = agents.iter().find(|row| row.id == agent.id).unwrap();
+    assert_eq!(stored_agent.attention_state, "ok");
+}
+
+#[tokio::test]
+async fn connect_upgrades_legacy_schema_with_phase1_defaults() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("legacy.sqlite");
+    let db_url = format!("sqlite://{}", db_path.display());
+
+    let options = SqliteConnectOptions::from_str(&db_url)
+        .expect("sqlite options")
+        .create_if_missing(true);
+    let mut conn = sqlx::SqliteConnection::connect_with(&options)
+        .await
+        .expect("legacy db connect");
+
+    conn.execute(include_str!("../../migrations/0001_init.sql"))
+        .await
+        .expect("migrate 0001");
+    conn.execute(include_str!("../../migrations/0002_session_lifecycle.sql"))
+        .await
+        .expect("migrate 0002");
+    sqlx::query("INSERT INTO agents (name, state, task_id, last_snippet) VALUES (?, ?, ?, ?)")
+        .bind("Legacy Agent")
+        .bind("idle")
+        .bind(Option::<i64>::None)
+        .bind("legacy boot")
+        .execute(&mut conn)
+        .await
+        .expect("insert legacy agent");
+    sqlx::query(
+        "INSERT INTO managed_sessions (provider, status, launch_command, launch_args_json, cwd, pid, agent_id, task_id, last_heartbeat_at, started_at, ended_at, failure_reason, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL, NULL, NULL)",
+    )
+    .bind("opencode")
+    .bind("active")
+    .bind("opencode")
+    .bind("[]")
+    .bind(Option::<String>::None)
+    .bind(Option::<i64>::None)
+    .bind(1_i64)
+    .bind(Option::<i64>::None)
+    .execute(&mut conn)
+    .await
+    .expect("insert legacy session");
+
+    drop(conn);
+
+    let upgraded = Db::connect(&db_url).await.expect("upgrade connect");
+    let agents = upgraded.list_agents().await.expect("list upgraded agents");
+    let agent = agents
+        .iter()
+        .find(|agent| agent.name == "Legacy Agent")
+        .expect("legacy agent upgraded");
+    assert_eq!(agent.provider, "opencode");
+    assert_eq!(agent.attention_state, "ok");
+    assert_eq!(agent.display_order, agent.id);
+
+    let sessions = upgraded
+        .list_managed_sessions(None, Some(10))
+        .await
+        .expect("list upgraded sessions");
+    let session = sessions
+        .iter()
+        .find(|session| session.agent_id == Some(agent.id))
+        .expect("legacy session upgraded");
+    assert!(!session.needs_input);
+    assert_eq!(session.transport, "pty");
+    assert!(session.last_activity_at.is_some());
 }

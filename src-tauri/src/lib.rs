@@ -2,9 +2,9 @@ use tauri::Manager;
 
 use crate::{terminal::TerminalManager, voice::VoiceManager};
 
-pub mod core;
 pub mod commands;
 pub mod config;
+pub mod core;
 pub mod db;
 pub mod linear;
 pub mod terminal;
@@ -46,9 +46,13 @@ pub fn run() {
             commands::tasks::delete_task_cmd,
             commands::tasks::move_task_state_cmd,
             commands::tasks::list_tasks_cmd,
+            commands::alerts::list_session_alerts_cmd,
+            commands::alerts::acknowledge_session_alert_cmd,
+            commands::alerts::resolve_session_alert_cmd,
             commands::agents::create_agent_cmd,
             commands::agents::assign_agent_to_task_cmd,
             commands::agents::list_agents_cmd,
+            commands::agents::list_agent_rows_cmd,
             commands::terminal::start_managed_session_cmd,
             commands::terminal::stop_managed_session_cmd,
             commands::terminal::list_managed_sessions_cmd,

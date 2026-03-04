@@ -192,10 +192,8 @@ pub fn decode_wav_pcm16_mono(bytes: &[u8]) -> Result<(u32, Vec<i16>)> {
                         bytes[cursor + 6],
                         bytes[cursor + 7],
                     ]));
-                    bits_per_sample = Some(u16::from_le_bytes([
-                        bytes[cursor + 14],
-                        bytes[cursor + 15],
-                    ]));
+                    bits_per_sample =
+                        Some(u16::from_le_bytes([bytes[cursor + 14], bytes[cursor + 15]]));
                 }
             }
             b"data" => {
@@ -276,7 +274,9 @@ pub fn trim_with_vad(
             trailing_silent_frames = 0;
         } else if speech_start.is_some() {
             trailing_silent_frames += 1;
-            if voiced_samples >= min_voiced_samples && trailing_silent_frames >= silence_frames_required {
+            if voiced_samples >= min_voiced_samples
+                && trailing_silent_frames >= silence_frames_required
+            {
                 speech_end = last_voiced_end;
                 break;
             }

@@ -3,23 +3,27 @@
     id: number;
     name: string;
     state: string;
+    provider: string;
+    attentionState: string;
+    unresolvedAlertCount: number;
+    activeSessionStatus?: string | null;
+    activeSessionNeedsInput?: boolean | null;
+    activeSessionInputReason?: string | null;
+    taskTitle?: string | null;
     taskId?: number | null;
+    lastActivityAt?: string | null;
     lastSnippet?: string | null;
     updatedAt: string;
   }[] = [];
 
-  export let tasks: { id: number; title: string; state: string; updatedAt?: string }[] = [];
   export let selectedId: number | null = null;
   export let onSelect: (id: number) => void;
-
-  const lookupTask = (taskId?: number | null) =>
-    tasks.find((task) => task.id === taskId);
 </script>
 
 <section class="panel">
   <header>
-    <h2>Active agents</h2>
-    <span class="count">{agents.length} online</span>
+    <h2>Agent runtime</h2>
+    <span class="count">{agents.length} total</span>
   </header>
 
   {#if agents.length === 0}
@@ -29,10 +33,11 @@
   {:else}
     <div class="table">
       <div class="row header">
-        <span>Name</span>
+        <span>Agent</span>
         <span>Status</span>
         <span>Task</span>
-        <span>Last update</span>
+        <span>Activity</span>
+        <span>Attention</span>
         <span>Snippet</span>
       </div>
       {#each agents as agent}
@@ -42,10 +47,19 @@
           class="row"
           on:click={() => onSelect?.(agent.id)}
         >
-          <span class="name">{agent.name}</span>
+          <span class="name">
+            {agent.name}
+            <small>{agent.provider}</small>
+          </span>
           <span class="state {agent.state}">{agent.state}</span>
-          <span class="task">{lookupTask(agent.taskId)?.title ?? "—"}</span>
-          <span class="updated">{agent.updatedAt}</span>
+          <span class="task">{agent.taskTitle ?? "—"}</span>
+          <span class="updated">{agent.lastActivityAt ?? agent.updatedAt}</span>
+          <span class="attention {agent.attentionState}">
+            {agent.activeSessionNeedsInput || agent.unresolvedAlertCount > 0 ? "needs input" : agent.attentionState}
+            {#if agent.unresolvedAlertCount > 0}
+              <strong>({agent.unresolvedAlertCount})</strong>
+            {/if}
+          </span>
           <span class="snippet">{agent.lastSnippet ?? "—"}</span>
         </button>
       {/each}
@@ -84,6 +98,9 @@
   .table {
     display: grid;
     gap: 6px;
+    max-height: 520px;
+    overflow-y: auto;
+    padding-right: 4px;
   }
 
   .empty {
@@ -96,7 +113,7 @@
 
   .row {
     display: grid;
-    grid-template-columns: 1.2fr 0.7fr 1.4fr 0.9fr 1.4fr;
+    grid-template-columns: 1.2fr 0.75fr 1.2fr 0.8fr 1fr 1.2fr;
     align-items: center;
     gap: 12px;
     padding: 12px 14px;
@@ -130,7 +147,18 @@
   }
 
   .name {
+    display: flex;
+    flex-direction: column;
     font-weight: 600;
+  }
+
+  .name small {
+    color: rgba(244, 242, 238, 0.55);
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    margin-top: 2px;
   }
 
   .state {
@@ -153,9 +181,33 @@
 
   .task,
   .updated,
+  .attention,
   .snippet {
     color: rgba(244, 242, 238, 0.7);
     font-size: 13px;
+  }
+
+  .attention {
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-size: 11px;
+  }
+
+  .attention.ok {
+    color: #7bdff2;
+  }
+
+  .attention.needs_input {
+    color: #ffd166;
+  }
+
+  .attention.blocked {
+    color: #ef476f;
+  }
+
+  .attention strong {
+    margin-left: 4px;
+    color: inherit;
   }
 
   .snippet {

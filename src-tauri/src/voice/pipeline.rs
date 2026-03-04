@@ -5,14 +5,14 @@ use std::sync::{
 
 use anyhow::{anyhow, Result};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
 use tauri::async_runtime::JoinHandle;
+use tauri::{AppHandle, Emitter};
 
 use crate::{
     config::EchoConfig,
     db::Db,
     terminal::TerminalManager,
-    voice::{audio, asr, intent, router, tts, wake_word},
+    voice::{asr, audio, intent, router, tts, wake_word},
 };
 
 const WAKE_SCAN_WINDOW_MS: u64 = 1200;
@@ -208,7 +208,8 @@ impl VoiceManager {
 
         self.set_state(app, VoiceRuntimeState::WakeDetected)?;
         self.set_state(app, VoiceRuntimeState::Transcribing)?;
-        self.handle_transcript(app, db, terminal, config, transcript).await
+        self.handle_transcript(app, db, terminal, config, transcript)
+            .await
     }
 
     async fn background_loop(
@@ -379,26 +380,17 @@ impl VoiceManager {
 
         self.set_state(app, VoiceRuntimeState::Executing)?;
 
-        let execution = router::execute_command(
-            app,
-            db,
-            terminal,
-            &config.model_endpoint,
-            &parsed,
-        )
-        .await;
+        let execution =
+            router::execute_command(app, db, terminal, &config.model_endpoint, &parsed).await;
         match execution {
             Ok(result) => {
                 if parsed.action == "query_agent_status" {
-                    let answer = result
-                        .get("answer")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| {
-                            result
-                                .get("statusReply")
-                                .and_then(|v| v.get("answer"))
-                                .and_then(|v| v.as_str())
-                        });
+                    let answer = result.get("answer").and_then(|v| v.as_str()).or_else(|| {
+                        result
+                            .get("statusReply")
+                            .and_then(|v| v.get("answer"))
+                            .and_then(|v| v.as_str())
+                    });
                     if let Some(answer) = answer {
                         if let Err(err) = tts::speak(answer) {
                             self.emit_error(app, format!("tts failed: {}", err))?;

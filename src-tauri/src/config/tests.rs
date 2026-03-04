@@ -10,7 +10,7 @@ fn config_defaults() {
     let dir = tempfile::tempdir().expect("temp");
     std::env::set_var("HOME", dir.path());
     let config = load_config().expect("load");
-    assert_eq!(config.mic_device, "default");
+    assert_eq!(config.mic_device, ":1");
     assert_eq!(config.hotkey, "cmd+shift+space");
     assert!(config.voice_enabled);
     assert_eq!(config.wake_word_phrase, "echo");

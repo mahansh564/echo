@@ -44,7 +44,9 @@ pub async fn execute_command(
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "Agent".to_string());
-            let agent = commands::agents::create_agent(db, name, None, None).await?;
+            let agent =
+                commands::agents::create_agent(db, name, Some("opencode".to_string()), None, None)
+                    .await?;
             Ok(serde_json::to_value(agent)?)
         }
         "assign_agent" => {
@@ -166,7 +168,9 @@ pub async fn execute_command(
             let session = sessions
                 .iter()
                 .find(|session| {
-                    let matches_agent = agent.as_ref().is_some_and(|a| session.agent_id == Some(a.id));
+                    let matches_agent = agent
+                        .as_ref()
+                        .is_some_and(|a| session.agent_id == Some(a.id));
                     let matches_task = task.as_ref().is_some_and(|t| session.task_id == Some(t.id));
                     matches_agent || matches_task
                 })

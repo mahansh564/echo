@@ -3,9 +3,9 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -77,7 +77,10 @@ impl TerminalManager {
             return Err(anyhow!("command is required"));
         }
 
-        let provider = request.provider.clone().unwrap_or_else(|| "opencode".to_string());
+        let provider = request
+            .provider
+            .clone()
+            .unwrap_or_else(|| "opencode".to_string());
         let args_json = serde_json::to_string(&request.args)?;
         let managed = tauri::async_runtime::block_on(db.create_managed_session(
             &provider,
@@ -225,16 +228,29 @@ impl TerminalManager {
                                 let db_write = db_for_reader.clone();
                                 let app_write = app_handle.clone();
                                 tauri::async_runtime::spawn(async move {
-                                    let _ = db_write.update_session_status(session_id, "active", None).await;
-                                    let _ = db_write.insert_session_event(session_id, "heartbeat", Some("session recovered"), None).await;
-                                    if let Ok(row) = db_write.get_managed_session(session_id).await {
-                                        let _ = app_write.emit("managed_session_updated", ManagedSessionUpdatedEvent {
+                                    let _ = db_write
+                                        .update_session_status(session_id, "active", None)
+                                        .await;
+                                    let _ = db_write
+                                        .insert_session_event(
                                             session_id,
-                                            status: row.status,
-                                            last_heartbeat_at: row.last_heartbeat_at,
-                                            agent_id: row.agent_id,
-                                            task_id: row.task_id,
-                                        });
+                                            "heartbeat",
+                                            Some("session recovered"),
+                                            None,
+                                        )
+                                        .await;
+                                    if let Ok(row) = db_write.get_managed_session(session_id).await
+                                    {
+                                        let _ = app_write.emit(
+                                            "managed_session_updated",
+                                            ManagedSessionUpdatedEvent {
+                                                session_id,
+                                                status: row.status,
+                                                last_heartbeat_at: row.last_heartbeat_at,
+                                                agent_id: row.agent_id,
+                                                task_id: row.task_id,
+                                            },
+                                        );
                                     }
                                 });
                             }
@@ -257,14 +273,18 @@ impl TerminalManager {
                                 let db_write = db_for_reader.clone();
                                 tauri::async_runtime::spawn(async move {
                                     if let Some(agent_id) = agent_id {
-                                        let _ = db_write.update_agent_snippet(agent_id, &snippet).await;
+                                        let _ =
+                                            db_write.update_agent_snippet(agent_id, &snippet).await;
                                     }
                                     let _ = db_write
                                         .insert_session_event(
                                             session_id,
                                             "snippet",
                                             None,
-                                            Some(&serde_json::json!({ "snippet": snippet }).to_string()),
+                                            Some(
+                                                &serde_json::json!({ "snippet": snippet })
+                                                    .to_string(),
+                                            ),
                                         )
                                         .await;
                                 });
@@ -281,19 +301,28 @@ impl TerminalManager {
                 let app_write = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
                     let _ = db_write.end_session(session_id, None).await;
-                    let _ = db_write.insert_session_event(session_id, "ended", Some("session ended"), None).await;
+                    let _ = db_write
+                        .insert_session_event(session_id, "ended", Some("session ended"), None)
+                        .await;
                     if let Ok(row) = db_write.get_managed_session(session_id).await {
-                        let _ = app_write.emit("managed_session_updated", ManagedSessionUpdatedEvent {
-                            session_id,
-                            status: row.status,
-                            last_heartbeat_at: row.last_heartbeat_at,
-                            agent_id: row.agent_id,
-                            task_id: row.task_id,
-                        });
+                        let _ = app_write.emit(
+                            "managed_session_updated",
+                            ManagedSessionUpdatedEvent {
+                                session_id,
+                                status: row.status,
+                                last_heartbeat_at: row.last_heartbeat_at,
+                                agent_id: row.agent_id,
+                                task_id: row.task_id,
+                            },
+                        );
                     }
                 });
             }
-            manager_for_reader.sessions.lock().unwrap().remove(&session_id);
+            manager_for_reader
+                .sessions
+                .lock()
+                .unwrap()
+                .remove(&session_id);
         });
 
         let db_for_monitor = db.clone();
@@ -301,35 +330,38 @@ impl TerminalManager {
         let stopped_for_monitor = Arc::clone(&stopped);
         let hb_for_monitor = Arc::clone(&last_heartbeat);
         let stalled_for_monitor = Arc::clone(&stalled_reported);
-        thread::spawn(move || {
-            loop {
-                if stopped_for_monitor.load(Ordering::SeqCst) {
-                    break;
-                }
-                thread::sleep(MONITOR_INTERVAL);
-                let elapsed = {
-                    let hb = hb_for_monitor.lock().unwrap();
-                    hb.elapsed()
-                };
-                if elapsed > STALE_THRESHOLD && !stalled_for_monitor.swap(true, Ordering::SeqCst) {
-                    let db_write = db_for_monitor.clone();
-                    let app_write = app_for_monitor.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _ = db_write.update_session_status(session_id, "stalled", None).await;
-                        let _ = db_write
-                            .insert_session_event(session_id, "stalled", Some("heartbeat stale"), None)
-                            .await;
-                        if let Ok(row) = db_write.get_managed_session(session_id).await {
-                            let _ = app_write.emit("managed_session_updated", ManagedSessionUpdatedEvent {
+        thread::spawn(move || loop {
+            if stopped_for_monitor.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(MONITOR_INTERVAL);
+            let elapsed = {
+                let hb = hb_for_monitor.lock().unwrap();
+                hb.elapsed()
+            };
+            if elapsed > STALE_THRESHOLD && !stalled_for_monitor.swap(true, Ordering::SeqCst) {
+                let db_write = db_for_monitor.clone();
+                let app_write = app_for_monitor.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = db_write
+                        .update_session_status(session_id, "stalled", None)
+                        .await;
+                    let _ = db_write
+                        .insert_session_event(session_id, "stalled", Some("heartbeat stale"), None)
+                        .await;
+                    if let Ok(row) = db_write.get_managed_session(session_id).await {
+                        let _ = app_write.emit(
+                            "managed_session_updated",
+                            ManagedSessionUpdatedEvent {
                                 session_id,
                                 status: row.status,
                                 last_heartbeat_at: row.last_heartbeat_at,
                                 agent_id: row.agent_id,
                                 task_id: row.task_id,
-                            });
-                        }
-                    });
-                }
+                            },
+                        );
+                    }
+                });
             }
         });
 
@@ -384,7 +416,10 @@ impl TerminalManager {
         let handle = sessions
             .get(&session_id)
             .ok_or_else(|| anyhow!("session not found"))?;
-        let mut writer = handle.writer.lock().map_err(|_| anyhow!("writer lock poisoned"))?;
+        let mut writer = handle
+            .writer
+            .lock()
+            .map_err(|_| anyhow!("writer lock poisoned"))?;
         writer.write_all(input.as_bytes())?;
         writer.flush()?;
         Ok(())
@@ -412,7 +447,10 @@ impl TerminalManager {
         Ok(TerminalSession {
             id: session.id as u64,
             agent_id,
-            command: format!("{} -l", std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())),
+            command: format!(
+                "{} -l",
+                std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+            ),
         })
     }
 

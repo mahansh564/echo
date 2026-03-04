@@ -9,8 +9,38 @@
     id: number;
     name: string;
     state: string;
+    provider: string;
+    displayOrder: number;
+    attentionState: string;
     taskId?: number | null;
+    taskTitle?: string | null;
+    activeSessionId?: number | null;
+    activeSessionStatus?: string | null;
+    activeSessionNeedsInput?: boolean | null;
+    activeSessionInputReason?: string | null;
+    unresolvedAlertCount: number;
+    lastActivityAt?: string | null;
+    lastInputRequiredAt?: string | null;
     lastSnippet?: string | null;
+    updatedAt: string;
+  };
+
+  type AgentRowApi = {
+    agentId: number;
+    agentName: string;
+    agentState: string;
+    provider: string;
+    displayOrder: number;
+    attentionState: string;
+    taskId?: number | null;
+    taskTitle?: string | null;
+    activeSessionId?: number | null;
+    activeSessionStatus?: string | null;
+    activeSessionNeedsInput?: boolean | null;
+    activeSessionInputReason?: string | null;
+    lastActivityAt?: string | null;
+    lastSnippet?: string | null;
+    unresolvedAlertCount: number;
     updatedAt: string;
   };
 
@@ -24,7 +54,7 @@
   type ManagedSession = {
     id: number;
     provider: string;
-    status: "waking" | "active" | "stalled" | "ended" | "failed";
+    status: "waking" | "active" | "stalled" | "needs_input" | "ended" | "failed";
     launchCommand: string;
     launchArgsJson: string;
     cwd?: string | null;
@@ -34,7 +64,26 @@
     lastHeartbeatAt?: string | null;
     startedAt?: string | null;
     endedAt?: string | null;
+    needsInput?: boolean;
+    inputReason?: string | null;
+    lastActivityAt?: string | null;
+    transport?: string;
+    attachCount?: number;
     failureReason?: string | null;
+    createdAt: string;
+    updatedAt: string;
+  };
+
+  type SessionAlert = {
+    id: number;
+    sessionId: number;
+    agentId?: number | null;
+    severity: "info" | "warning" | "critical" | string;
+    reason: string;
+    message: string;
+    requiresAck: boolean;
+    acknowledgedAt?: string | null;
+    resolvedAt?: string | null;
     createdAt: string;
     updatedAt: string;
   };
@@ -102,6 +151,7 @@
   let lastCommand = $state<string>("");
   let voiceInput = $state<string>("");
   let sessionEvents = $state<SessionEvent[]>([]);
+  let unresolvedAlerts = $state<SessionAlert[]>([]);
   let sessionEventsFor = $state<number | null>(null);
   let selectedSessionId = $state<number | null>(null);
   let liveTerminalOutput = $state<string>("");
@@ -115,9 +165,16 @@
     tasks.find((task) => task.id === selectedAgent?.taskId)
   );
 
+  const selectedAgentAlerts = $derived(
+    selectedAgent
+      ? unresolvedAlerts.filter((alert) => alert.agentId === selectedAgent.id)
+      : []
+  );
+
   const selectedAgentSession = $derived(
     selectedAgent
-      ? sessions.find(
+      ? sessions.find((session) => session.id === selectedAgent.activeSessionId) ??
+        sessions.find(
           (session) =>
             session.agentId === selectedAgent.id &&
             ["waking", "active", "stalled"].includes(session.status)
@@ -144,26 +201,66 @@
     return `${days}d ago`;
   };
 
-  const applyRelativeTimes = (list: Agent[], taskList: Task[]) => {
+  const applyRelativeTimes = (
+    list: Agent[],
+    taskList: Task[],
+    alertList: SessionAlert[]
+  ) => {
     agents = list.map((agent) => ({
       ...agent,
-      updatedAt: formatRelativeTime(agent.updatedAt)
+      updatedAt: formatRelativeTime(agent.updatedAt),
+      lastActivityAt: formatRelativeTime(agent.lastActivityAt ?? agent.updatedAt),
+      lastInputRequiredAt: formatRelativeTime(agent.lastInputRequiredAt ?? null)
     }));
     tasks = taskList.map((task) => ({
       ...task,
       updatedAt: formatRelativeTime(task.updatedAt)
+    }));
+    unresolvedAlerts = alertList.map((alert) => ({
+      ...alert,
+      createdAt: formatRelativeTime(alert.createdAt),
+      updatedAt: formatRelativeTime(alert.updatedAt),
+      acknowledgedAt: alert.acknowledgedAt ? formatRelativeTime(alert.acknowledgedAt) : null,
+      resolvedAt: alert.resolvedAt ? formatRelativeTime(alert.resolvedAt) : null
     }));
   };
 
   async function loadData() {
     loading = true;
     try {
-      const [tasksResponse, agentsResponse, sessionsResponse] = await Promise.all([
+      const [tasksResponse, agentRowsResponse, sessionsResponse, alertsResponse] = await Promise.all([
         invoke("list_tasks_cmd"),
-        invoke("list_agents_cmd"),
-        invoke("list_managed_sessions_cmd", { status: null, limit: 100 })
+        invoke("list_agent_rows_cmd", { limit: 200 }),
+        invoke("list_managed_sessions_cmd", { status: null, limit: 200 }),
+        invoke("list_session_alerts_cmd", {
+          agentId: null,
+          unresolvedOnly: true,
+          limit: 200
+        })
       ]);
-      applyRelativeTimes(agentsResponse as Agent[], tasksResponse as Task[]);
+      const mappedAgents = (agentRowsResponse as AgentRowApi[]).map((row) => ({
+        id: row.agentId,
+        name: row.agentName,
+        state: row.agentState,
+        provider: row.provider,
+        displayOrder: row.displayOrder,
+        attentionState: row.attentionState,
+        taskId: row.taskId ?? null,
+        taskTitle: row.taskTitle ?? null,
+        activeSessionId: row.activeSessionId ?? null,
+        activeSessionStatus: row.activeSessionStatus ?? null,
+        activeSessionNeedsInput: row.activeSessionNeedsInput ?? null,
+        activeSessionInputReason: row.activeSessionInputReason ?? null,
+        unresolvedAlertCount: row.unresolvedAlertCount ?? 0,
+        lastActivityAt: row.lastActivityAt ?? null,
+        lastSnippet: row.lastSnippet ?? null,
+        updatedAt: row.updatedAt
+      }));
+      applyRelativeTimes(
+        mappedAgents,
+        tasksResponse as Task[],
+        alertsResponse as SessionAlert[]
+      );
       sessions = sessionsResponse as ManagedSession[];
       if (!selectedSessionId && sessions.length > 0) {
         selectedSessionId = sessions[0].id;
@@ -181,6 +278,10 @@
       }
       if (agents.length === 0) {
         selectedAgentId = 0;
+      }
+      const focusedAgent = agents.find((agent) => agent.id === selectedAgentId);
+      if (focusedAgent?.activeSessionId) {
+        selectedSessionId = focusedAgent.activeSessionId;
       }
     } catch (error) {
       console.error("Failed to load data", error);
@@ -239,6 +340,32 @@
       sessionEvents = response;
     } catch (error) {
       console.error("Failed to load session events", error);
+    }
+  }
+
+  const lookupAgentName = (agentId?: number | null) =>
+    agents.find((agent) => agent.id === agentId)?.name ?? "Unassigned";
+
+  function focusSession(sessionId: number) {
+    selectedSessionId = sessionId;
+    void loadTerminalOutput(sessionId);
+  }
+
+  async function acknowledgeAlert(alertId: number) {
+    try {
+      await invoke("acknowledge_session_alert_cmd", { alertId });
+      await loadData();
+    } catch (error) {
+      console.error("Failed to acknowledge session alert", error);
+    }
+  }
+
+  async function resolveAlert(alertId: number) {
+    try {
+      await invoke("resolve_session_alert_cmd", { alertId });
+      await loadData();
+    } catch (error) {
+      console.error("Failed to resolve session alert", error);
     }
   }
 
@@ -345,7 +472,12 @@
         if (payload.agentId) {
           agents = agents.map((agent) =>
             agent.id === payload.agentId
-              ? { ...agent, lastSnippet: payload.snippet, updatedAt: "just now" }
+              ? {
+                  ...agent,
+                  lastSnippet: payload.snippet,
+                  lastActivityAt: "just now",
+                  updatedAt: "just now"
+                }
               : agent
           );
         }
@@ -475,7 +607,6 @@
   <section class="layout">
     <AgentList
       {agents}
-      {tasks}
       selectedId={selectedAgentId}
       onSelect={(id: number) => (selectedAgentId = id)}
     />
@@ -494,6 +625,43 @@
           : undefined
       }
     />
+  </section>
+
+  <section class="alerts-panel">
+    <header>
+      <h2>Input needed</h2>
+      <span>{unresolvedAlerts.length} unresolved</span>
+    </header>
+    {#if unresolvedAlerts.length === 0}
+      <p class="empty-alerts">No active input requests.</p>
+    {:else}
+      <div class="alerts-table">
+        <div class="alerts-row header">
+          <span>Agent</span>
+          <span>Reason</span>
+          <span>Message</span>
+          <span>Created</span>
+          <span>Actions</span>
+        </div>
+        {#each unresolvedAlerts as alert}
+          <div class="alerts-row">
+            <span>{lookupAgentName(alert.agentId)}</span>
+            <span class="alert-reason">{alert.reason}</span>
+            <span>{alert.message}</span>
+            <span>{alert.createdAt}</span>
+            <span class="actions">
+              <button class="ghost small" onclick={() => focusSession(alert.sessionId)}>
+                Open terminal
+              </button>
+              {#if alert.requiresAck && !alert.acknowledgedAt}
+                <button class="ghost small" onclick={() => acknowledgeAlert(alert.id)}>Acknowledge</button>
+              {/if}
+              <button class="primary small" onclick={() => resolveAlert(alert.id)}>Resolve</button>
+            </span>
+          </div>
+        {/each}
+      </div>
+    {/if}
   </section>
 
   <section class="sessions-panel">
@@ -525,15 +693,12 @@
             <span class="actions">
               <button
                 class="ghost small"
-                onclick={() => {
-                  selectedSessionId = session.id;
-                  void loadTerminalOutput(session.id);
-                }}
+                onclick={() => focusSession(session.id)}
               >
                 Open terminal
               </button>
               <button class="ghost small" onclick={() => openSessionLogs(session.id)}>Open logs</button>
-              {#if session.status === "active" || session.status === "stalled" || session.status === "waking"}
+              {#if session.status === "active" || session.status === "stalled" || session.status === "waking" || session.status === "needs_input"}
                 <button class="ghost small" onclick={() => stopSession(session.id)}>Stop</button>
               {/if}
               <button class="primary small" onclick={() => restartSession(session)}>Restart</button>
@@ -566,6 +731,11 @@
       <span>{selectedSession ? `Session #${selectedSession.id}` : "No session selected"}</span>
     </header>
     <pre>{liveTerminalOutput || "No terminal output yet."}</pre>
+    {#if selectedAgent && selectedAgentAlerts.length > 0}
+      <div class="selected-agent-alerts">
+        <p>Selected agent unresolved alerts: {selectedAgentAlerts.length}</p>
+      </div>
+    {/if}
     <div class="terminal-input-row">
       <input
         bind:value={terminalInput}
@@ -702,6 +872,58 @@
     border: 1px solid rgba(255, 255, 255, 0.08);
   }
 
+  .alerts-panel {
+    margin-top: 20px;
+    padding: 16px;
+    border-radius: 16px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .alerts-panel header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+
+  .empty-alerts {
+    margin: 0;
+    color: rgba(244, 242, 238, 0.7);
+  }
+
+  .alerts-table {
+    display: grid;
+    gap: 6px;
+    max-height: 260px;
+    overflow-y: auto;
+  }
+
+  .alerts-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 2fr 0.8fr 1.2fr;
+    gap: 10px;
+    align-items: center;
+    padding: 10px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.03);
+  }
+
+  .alerts-row.header {
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: rgba(244, 242, 238, 0.6);
+    background: transparent;
+  }
+
+  .alert-reason {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 12px;
+    color: #ffd166;
+  }
+
   .sessions-panel header {
     display: flex;
     justify-content: space-between;
@@ -741,6 +963,7 @@
   }
 
   .status.stalled,
+  .status.needs_input,
   .status.failed {
     color: #ef476f;
   }
@@ -807,6 +1030,22 @@
     gap: 10px;
   }
 
+  .selected-agent-alerts {
+    margin-bottom: 12px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 209, 102, 0.35);
+    background: rgba(255, 209, 102, 0.08);
+  }
+
+  .selected-agent-alerts p {
+    margin: 0;
+    font-size: 12px;
+    color: #ffd166;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
   .terminal-input-row input {
     padding: 10px 12px;
     border-radius: 10px;
@@ -831,6 +1070,11 @@
     }
 
     .row {
+      grid-template-columns: 1fr;
+      gap: 6px;
+    }
+
+    .alerts-row {
       grid-template-columns: 1fr;
       gap: 6px;
     }

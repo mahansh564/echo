@@ -1,5 +1,5 @@
-mod audio;
 mod asr;
+mod audio;
 mod intent;
 mod pipeline;
 mod resolver;

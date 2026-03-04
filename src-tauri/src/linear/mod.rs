@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::db::Db;
+use anyhow::Result;
 
 pub struct LinearImporter {
     db: Db,
