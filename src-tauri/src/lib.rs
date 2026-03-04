@@ -7,6 +7,7 @@ pub mod config;
 pub mod core;
 pub mod db;
 pub mod linear;
+pub mod providers;
 pub mod terminal;
 pub mod voice;
 
@@ -28,6 +29,8 @@ pub fn run() {
             let db = tauri::async_runtime::block_on(db::Db::connect(&db_url))?;
             app.manage(db);
             let terminal = TerminalManager::new();
+            let db_state = app.state::<db::Db>().inner().clone();
+            let _ = tauri::async_runtime::block_on(terminal.reconcile_orphan_sessions(&db_state));
             app.manage(terminal.clone());
             let config = config::load_config()?;
             let voice = VoiceManager::new();

@@ -112,11 +112,11 @@ This roadmap assumes a v1 target of up to 10 concurrent active sessions and prio
 
 ### Phase 2 - Session Supervisor + OpenCode Adapter
 
-- [ ] Refactor terminal runtime into a supervisor actor owning session lifecycle and event fanout.
-- [ ] Implement `OpenCodeAdapter` with structured event parsing pipeline.
-- [ ] Map provider events into session state + alerts + heartbeat updates.
-- [ ] Emit consistent runtime events for UI and voice.
-- [ ] Add failure handling for adapter parse errors and session orphan cleanup.
+- [x] Refactor terminal runtime into a supervisor actor owning session lifecycle and event fanout.
+- [x] Implement `OpenCodeAdapter` with structured event parsing pipeline.
+- [x] Map provider events into session state + alerts + heartbeat updates.
+- [x] Emit consistent runtime events for UI and voice.
+- [x] Add failure handling for adapter parse errors and session orphan cleanup.
 
 ### Phase 3 - Multi-Agent Vertical UI
 

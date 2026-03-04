@@ -106,5 +106,8 @@ pub async fn send_terminal_input_cmd(
     )
     .await
     .map_err(|e| e.to_string())?;
+    db.clear_session_needs_input(session_id)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }

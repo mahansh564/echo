@@ -161,6 +161,17 @@ impl Db {
         Ok(agents)
     }
 
+    pub async fn get_agent(&self, agent_id: i64) -> Result<models::Agent> {
+        let agent = sqlx::query_as::<_, models::Agent>(&format!(
+            "SELECT {} FROM agents WHERE id = ?",
+            AGENT_SELECT_COLUMNS
+        ))
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(agent)
+    }
+
     pub async fn list_agent_rows(&self, limit: Option<i64>) -> Result<Vec<AgentRow>> {
         let max = limit.unwrap_or(100);
         let rows = sqlx::query_as::<_, AgentRow>(
@@ -299,6 +310,106 @@ impl Db {
         .bind(session_id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn mark_session_needs_input(
+        &self,
+        session_id: i64,
+        reason: &str,
+        message: &str,
+    ) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "UPDATE managed_sessions
+             SET status = 'needs_input',
+                 needs_input = 1,
+                 input_reason = ?,
+                 last_activity_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(reason)
+        .bind(session_id)
+        .execute(&mut *conn)
+        .await?;
+
+        let row = sqlx::query_as::<_, ManagedSession>(&format!(
+            "SELECT {} FROM managed_sessions WHERE id = ?",
+            MANAGED_SESSION_SELECT_COLUMNS
+        ))
+        .bind(session_id)
+        .fetch_one(&mut *conn)
+        .await?;
+
+        if let Some(agent_id) = row.agent_id {
+            sqlx::query(
+                "UPDATE agents
+                 SET attention_state = 'needs_input',
+                     last_input_required_at = CURRENT_TIMESTAMP,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?",
+            )
+            .bind(agent_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO session_events (session_id, event_type, message, payload_json)
+             VALUES (?, 'input_required', ?, ?)",
+        )
+        .bind(session_id)
+        .bind(Some("session requires input"))
+        .bind(Some(
+            serde_json::json!({ "reason": reason, "message": message }).to_string(),
+        ))
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear_session_needs_input(&self, session_id: i64) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "UPDATE managed_sessions
+             SET status = CASE WHEN status = 'needs_input' THEN 'active' ELSE status END,
+                 needs_input = 0,
+                 input_reason = NULL,
+                 last_activity_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(session_id)
+        .execute(&mut *conn)
+        .await?;
+
+        let row = sqlx::query_as::<_, ManagedSession>(&format!(
+            "SELECT {} FROM managed_sessions WHERE id = ?",
+            MANAGED_SESSION_SELECT_COLUMNS
+        ))
+        .bind(session_id)
+        .fetch_one(&mut *conn)
+        .await?;
+
+        if let Some(agent_id) = row.agent_id {
+            sqlx::query(
+                "UPDATE agents
+                 SET attention_state = CASE
+                     WHEN EXISTS (
+                        SELECT 1 FROM session_alerts
+                        WHERE agent_id = ? AND resolved_at IS NULL
+                     ) THEN attention_state
+                     ELSE 'ok'
+                 END,
+                 updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?",
+            )
+            .bind(agent_id)
+            .bind(agent_id)
+            .execute(&mut *conn)
+            .await?;
+        }
         Ok(())
     }
 
