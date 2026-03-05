@@ -1,29 +1,29 @@
 <script lang="ts">
-  export let agent:
-    | {
-        id: number;
-        name: string;
-        state: string;
-        provider: string;
-        attentionState: string;
-        unresolvedAlertCount: number;
-        activeSessionStatus?: string | null;
-        activeSessionNeedsInput?: boolean | null;
-        activeSessionInputReason?: string | null;
-        taskTitle?: string | null;
-        lastActivityAt?: string | null;
-        taskId?: number | null;
-        lastSnippet?: string | null;
-        updatedAt: string;
-      }
-    | undefined;
-  export let task:
-    | {
-        id: number;
-        title: string;
-        state: string;
-      }
-    | undefined;
+  type AgentRow = {
+    id: number;
+    name: string;
+    state: string;
+    provider: string;
+    attentionState: string;
+    unresolvedAlertCount: number;
+    activeSessionStatus?: string | null;
+    activeSessionNeedsInput?: boolean | null;
+    activeSessionInputReason?: string | null;
+    taskTitle?: string | null;
+    lastActivityAt?: string | null;
+    taskId?: number | null;
+    lastSnippet?: string | null;
+    updatedAt: string;
+  };
+
+  type TaskSummary = {
+    id: number;
+    title: string;
+    state: string;
+  };
+
+  export let agent: AgentRow | undefined;
+  export let task: TaskSummary | undefined;
   export let onOpenSession: (() => void) | undefined;
   export let canOpenSession: boolean = true;
   export let linkedSession:

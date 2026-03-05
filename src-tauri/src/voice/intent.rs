@@ -1,5 +1,15 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const ACTION_STATUS_OVERVIEW: &str = "status_overview";
+pub const ACTION_STATUS_AGENT: &str = "status_agent";
+pub const ACTION_START_SESSION: &str = "start_session";
+pub const ACTION_STOP_SESSION: &str = "stop_session";
+pub const ACTION_ATTACH_AGENT: &str = "attach_agent";
+pub const ACTION_SEND_INPUT: &str = "send_input";
+pub const ACTION_LIST_INPUT_NEEDED: &str = "list_input_needed";
+pub const ACTION_UNKNOWN: &str = "unknown";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IntentCommand {
@@ -13,11 +23,19 @@ struct OllamaGenerateResponse {
 }
 
 pub async fn parse_intent(model_endpoint: &str, input: &str) -> Result<IntentCommand> {
-    if let Ok(intent) = parse_intent_with_llm(model_endpoint, input).await {
-        return Ok(intent);
+    let deterministic = parse_with_rules(input);
+    if deterministic.action != ACTION_UNKNOWN {
+        return Ok(deterministic);
     }
 
-    Ok(parse_with_rules(input))
+    if let Ok(intent) = parse_intent_with_llm(model_endpoint, input).await {
+        let normalized = normalize_llm_intent(intent, input);
+        if normalized.action != ACTION_UNKNOWN {
+            return Ok(normalized);
+        }
+    }
+
+    Ok(deterministic)
 }
 
 async fn parse_intent_with_llm(model_endpoint: &str, input: &str) -> Result<IntentCommand> {
@@ -28,7 +46,7 @@ async fn parse_intent_with_llm(model_endpoint: &str, input: &str) -> Result<Inte
     };
 
     let prompt = format!(
-        "Extract one command from this transcript. Return only JSON as {{\"action\": string, \"payload\": object}}.\nAllowed actions: create_task, create_agent, assign_agent, list_tasks, list_agents, start_opencode_session, query_agent_status, unknown.\nFor create_task payload: {{\"title\": string}}.\nFor create_agent payload: {{\"name\": string|null}}.\nFor assign_agent payload: {{\"agent_id\": number, \"task_id\": number|null}}.\nFor start_opencode_session payload: {{\"command\": string|null, \"args\": string[], \"cwd\": string|null, \"agent_id\": number|null, \"task_id\": number|null}}.\nFor query_agent_status payload: {{\"query\": string}}.\nTranscript: {}",
+        "Extract one command from this transcript. Return only JSON as {{\"action\": string, \"payload\": object}}.\nAllowed actions: status_overview, status_agent, start_session, stop_session, attach_agent, send_input, list_input_needed, unknown.\nPayload contracts:\n- status_overview: {{\"confirmed\": boolean}}\n- status_agent: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"query\": string, \"confirmed\": boolean}}\n- start_session: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"command\": string|null, \"args\": string[], \"cwd\": string|null, \"confirmed\": boolean}}\n- stop_session: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"confirmed\": boolean}}\n- attach_agent: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"confirmed\": boolean}}\n- send_input: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"input\": string, \"confirmed\": boolean}}\n- list_input_needed: {{\"confirmed\": boolean}}\nTranscript: {}",
         input
     );
 
@@ -50,66 +68,346 @@ async fn parse_intent_with_llm(model_endpoint: &str, input: &str) -> Result<Inte
 }
 
 fn parse_with_rules(input: &str) -> IntentCommand {
-    let normalized = input.trim().to_lowercase();
-    if normalized.starts_with("create task") || normalized.contains("new task") {
-        return IntentCommand {
-            action: "create_task".to_string(),
-            payload: serde_json::json!({ "title": input.trim() }),
-        };
-    }
+    let trimmed = input.trim();
+    let normalized = trimmed.to_lowercase();
+    let confirmed = has_confirmation_prefix(&normalized);
+    let normalized_without_confirmation = strip_confirmation_prefix(&normalized);
+    let target = parse_agent_target(&normalized_without_confirmation);
 
-    if normalized.contains("new agent")
-        || normalized.contains("create agent")
-        || normalized.contains("open a new agent")
-        || normalized.starts_with("open agent")
-        || normalized.starts_with("spawn agent")
+    if normalized_without_confirmation.contains("needs input")
+        || normalized_without_confirmation.contains("need input")
+        || normalized_without_confirmation.contains("input needed")
+        || normalized_without_confirmation.contains("pending input")
     {
         return IntentCommand {
-            action: "create_agent".to_string(),
-            payload: serde_json::json!({ "name": serde_json::Value::Null }),
-        };
-    }
-
-    if normalized.contains("list tasks") {
-        return IntentCommand {
-            action: "list_tasks".to_string(),
-            payload: serde_json::json!({}),
-        };
-    }
-
-    if normalized.contains("list agents") {
-        return IntentCommand {
-            action: "list_agents".to_string(),
-            payload: serde_json::json!({}),
-        };
-    }
-
-    if normalized.contains("start")
-        && (normalized.contains("opencode") || normalized.contains("session"))
-    {
-        return IntentCommand {
-            action: "start_opencode_session".to_string(),
+            action: ACTION_LIST_INPUT_NEEDED.to_string(),
             payload: serde_json::json!({
-                "command": serde_json::Value::Null,
-                "args": [],
-                "cwd": serde_json::Value::Null,
-                "agent_id": serde_json::Value::Null,
-                "task_id": serde_json::Value::Null,
+                "confirmed": confirmed,
             }),
         };
     }
 
-    if normalized.contains("status") {
+    if normalized_without_confirmation.contains("overview")
+        || normalized_without_confirmation.contains("overall status")
+        || normalized_without_confirmation.contains("status summary")
+        || normalized_without_confirmation.contains("how many agents")
+    {
         return IntentCommand {
-            action: "query_agent_status".to_string(),
-            payload: serde_json::json!({ "query": input.trim() }),
+            action: ACTION_STATUS_OVERVIEW.to_string(),
+            payload: serde_json::json!({
+                "confirmed": confirmed,
+            }),
+        };
+    }
+
+    if normalized_without_confirmation.contains("status")
+        && (target.has_any_hint
+            || normalized_without_confirmation.contains("agent ")
+            || normalized_without_confirmation.contains("for "))
+    {
+        return IntentCommand {
+            action: ACTION_STATUS_AGENT.to_string(),
+            payload: serde_json::json!({
+                "agent_index": target.agent_index,
+                "agent_name_hint": target.agent_name_hint,
+                "confirmed": confirmed,
+                "query": trimmed,
+            }),
+        };
+    }
+
+    if normalized_without_confirmation.starts_with("status")
+        || normalized_without_confirmation.contains("system status")
+    {
+        return IntentCommand {
+            action: ACTION_STATUS_OVERVIEW.to_string(),
+            payload: serde_json::json!({
+                "confirmed": confirmed,
+            }),
+        };
+    }
+
+    if let Some(send_input_text) = parse_send_input_text(&normalized_without_confirmation, trimmed)
+    {
+        return IntentCommand {
+            action: ACTION_SEND_INPUT.to_string(),
+            payload: serde_json::json!({
+                "agent_index": target.agent_index,
+                "agent_name_hint": target.agent_name_hint,
+                "input": send_input_text,
+                "confirmed": confirmed,
+            }),
+        };
+    }
+
+    if normalized_without_confirmation.contains("attach")
+        && (normalized_without_confirmation.contains("agent ") || target.has_any_hint)
+    {
+        return IntentCommand {
+            action: ACTION_ATTACH_AGENT.to_string(),
+            payload: serde_json::json!({
+                "agent_index": target.agent_index,
+                "agent_name_hint": target.agent_name_hint,
+                "confirmed": confirmed,
+            }),
+        };
+    }
+
+    if normalized_without_confirmation.contains("start session")
+        || normalized_without_confirmation.contains("open session")
+        || normalized_without_confirmation.contains("resume session")
+    {
+        return IntentCommand {
+            action: ACTION_START_SESSION.to_string(),
+            payload: serde_json::json!({
+                "agent_index": target.agent_index,
+                "agent_name_hint": target.agent_name_hint,
+                "command": parse_start_session_command(trimmed),
+                "args": [],
+                "cwd": serde_json::Value::Null,
+                "confirmed": confirmed,
+            }),
+        };
+    }
+
+    if normalized_without_confirmation.contains("stop session")
+        || normalized_without_confirmation.contains("end session")
+        || normalized_without_confirmation.contains("terminate session")
+    {
+        return IntentCommand {
+            action: ACTION_STOP_SESSION.to_string(),
+            payload: serde_json::json!({
+                "agent_index": target.agent_index,
+                "agent_name_hint": target.agent_name_hint,
+                "confirmed": confirmed,
+            }),
         };
     }
 
     IntentCommand {
-        action: "unknown".to_string(),
+        action: ACTION_UNKNOWN.to_string(),
         payload: serde_json::json!({ "raw": input }),
     }
+}
+
+fn normalize_llm_intent(intent: IntentCommand, input: &str) -> IntentCommand {
+    let action = intent.action.trim().to_lowercase();
+    match action.as_str() {
+        ACTION_STATUS_OVERVIEW
+        | ACTION_STATUS_AGENT
+        | ACTION_START_SESSION
+        | ACTION_STOP_SESSION
+        | ACTION_ATTACH_AGENT
+        | ACTION_SEND_INPUT
+        | ACTION_LIST_INPUT_NEEDED => normalize_payload_for_action(&action, intent.payload, input),
+        "query_agent_status" => {
+            let query = intent
+                .payload
+                .get("query")
+                .and_then(|value| value.as_str())
+                .unwrap_or(input);
+            let target = parse_agent_target(&query.to_lowercase());
+            normalize_payload_for_action(
+                ACTION_STATUS_AGENT,
+                serde_json::json!({
+                    "agent_index": target.agent_index,
+                    "agent_name_hint": target.agent_name_hint,
+                    "query": query,
+                    "confirmed": false,
+                }),
+                input,
+            )
+        }
+        "start_opencode_session" => normalize_payload_for_action(
+            ACTION_START_SESSION,
+            serde_json::json!({
+                "agent_index": intent.payload.get("agent_index").and_then(|v| v.as_i64()),
+                "agent_name_hint": intent.payload.get("agent_name_hint").and_then(|v| v.as_str()),
+                "command": intent.payload.get("command").and_then(|v| v.as_str()),
+                "args": intent.payload.get("args").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "cwd": intent.payload.get("cwd").cloned().unwrap_or(Value::Null),
+                "confirmed": false,
+            }),
+            input,
+        ),
+        _ => parse_with_rules(input),
+    }
+}
+
+fn normalize_payload_for_action(action: &str, payload: Value, input: &str) -> IntentCommand {
+    let input_target = parse_agent_target(&input.to_lowercase());
+    let agent_index = payload
+        .get("agent_index")
+        .and_then(|value| value.as_i64())
+        .or(input_target.agent_index);
+    let agent_name_hint = payload
+        .get("agent_name_hint")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .or(input_target.agent_name_hint);
+    let confirmed = payload
+        .get("confirmed")
+        .and_then(|value| value.as_bool())
+        .unwrap_or_else(|| has_confirmation_prefix(&input.to_lowercase()));
+
+    let normalized_payload = match action {
+        ACTION_STATUS_OVERVIEW | ACTION_LIST_INPUT_NEEDED => {
+            serde_json::json!({ "confirmed": confirmed })
+        }
+        ACTION_STATUS_AGENT => serde_json::json!({
+            "agent_index": agent_index,
+            "agent_name_hint": agent_name_hint,
+            "query": payload.get("query").and_then(|value| value.as_str()).unwrap_or(input),
+            "confirmed": confirmed,
+        }),
+        ACTION_START_SESSION => serde_json::json!({
+            "agent_index": agent_index,
+            "agent_name_hint": agent_name_hint,
+            "command": payload.get("command").and_then(|value| value.as_str()),
+            "args": payload.get("args").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "cwd": payload.get("cwd").cloned().unwrap_or(Value::Null),
+            "confirmed": confirmed,
+        }),
+        ACTION_STOP_SESSION | ACTION_ATTACH_AGENT => serde_json::json!({
+            "agent_index": agent_index,
+            "agent_name_hint": agent_name_hint,
+            "confirmed": confirmed,
+        }),
+        ACTION_SEND_INPUT => serde_json::json!({
+            "agent_index": agent_index,
+            "agent_name_hint": agent_name_hint,
+            "input": payload.get("input").and_then(|value| value.as_str()).unwrap_or(""),
+            "confirmed": confirmed,
+        }),
+        _ => serde_json::json!({ "raw": input }),
+    };
+
+    IntentCommand {
+        action: action.to_string(),
+        payload: normalized_payload,
+    }
+}
+
+#[derive(Default)]
+struct ParsedAgentTarget {
+    agent_index: Option<i64>,
+    agent_name_hint: Option<String>,
+    has_any_hint: bool,
+}
+
+fn parse_agent_target(normalized: &str) -> ParsedAgentTarget {
+    let mut parsed = ParsedAgentTarget::default();
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    for (idx, token) in tokens.iter().enumerate() {
+        if *token != "agent" {
+            continue;
+        }
+        let Some(next_raw) = tokens.get(idx + 1) else {
+            continue;
+        };
+        let next = sanitize_token(next_raw);
+        if next.is_empty() {
+            continue;
+        }
+        if let Ok(index) = next.parse::<i64>() {
+            if index > 0 {
+                parsed.agent_index = Some(index);
+                parsed.has_any_hint = true;
+                return parsed;
+            }
+        }
+        if let Some(index) = nato_to_index(next) {
+            parsed.agent_index = Some(index as i64);
+            parsed.agent_name_hint = Some(next.to_string());
+            parsed.has_any_hint = true;
+            return parsed;
+        }
+        parsed.agent_name_hint = Some(next.to_string());
+        parsed.has_any_hint = true;
+        return parsed;
+    }
+    parsed
+}
+
+fn nato_to_index(alias: &str) -> Option<usize> {
+    match alias {
+        "alpha" => Some(1),
+        "bravo" => Some(2),
+        "charlie" => Some(3),
+        "delta" => Some(4),
+        "echo" => Some(5),
+        "foxtrot" => Some(6),
+        "golf" => Some(7),
+        "hotel" => Some(8),
+        "india" => Some(9),
+        "juliet" => Some(10),
+        _ => None,
+    }
+}
+
+fn sanitize_token(token: &str) -> &str {
+    token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+}
+
+fn has_confirmation_prefix(normalized: &str) -> bool {
+    normalized.starts_with("confirm ")
+        || normalized.starts_with("yes ")
+        || normalized == "confirm"
+        || normalized == "yes"
+}
+
+fn strip_confirmation_prefix(normalized: &str) -> String {
+    if let Some(value) = normalized.strip_prefix("confirm ") {
+        return value.trim().to_string();
+    }
+    if let Some(value) = normalized.strip_prefix("yes ") {
+        return value.trim().to_string();
+    }
+    normalized.to_string()
+}
+
+fn parse_send_input_text(normalized: &str, original: &str) -> Option<String> {
+    let lower_original = original.to_lowercase();
+    let patterns = [" tell ", " ask ", " send ", " message "];
+    for pattern in patterns {
+        if let Some(idx) = lower_original.find(pattern) {
+            let tail = original[idx + pattern.len()..].trim();
+            if let Some(stripped) = tail.strip_prefix("agent ") {
+                if let Some(to_idx) = stripped.to_lowercase().find(" to ") {
+                    let text = stripped[to_idx + 4..].trim();
+                    if !text.is_empty() {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if normalized.contains("agent ") && normalized.contains(" to ") {
+        let marker = lower_original.find(" to ")?;
+        let text = original[marker + 4..].trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
+fn parse_start_session_command(original: &str) -> Value {
+    let lower = original.to_lowercase();
+    if let Some(idx) = lower.find(" with ") {
+        let command = original[idx + 6..].trim();
+        if !command.is_empty() {
+            return Value::String(command.to_string());
+        }
+    }
+    if let Some(idx) = lower.find(" running ") {
+        let command = original[idx + 9..].trim();
+        if !command.is_empty() {
+            return Value::String(command.to_string());
+        }
+    }
+    Value::Null
 }
 
 #[cfg(test)]
@@ -118,17 +416,141 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_rule_for_task_creation() {
-        let intent = parse_intent("http://localhost:9", "create task write docs")
+        let intent = parse_intent("http://localhost:9", "status of agent 3")
             .await
             .expect("intent");
-        assert_eq!(intent.action, "create_task");
+        assert_eq!(intent.action, "status_agent");
+        assert_eq!(
+            intent
+                .payload
+                .get("agent_index")
+                .and_then(|value| value.as_i64()),
+            Some(3)
+        );
     }
 
     #[tokio::test]
-    async fn fallback_rule_for_agent_creation() {
-        let intent = parse_intent("http://localhost:9", "Open a new agent.")
+    async fn fallback_rule_for_alias_target() {
+        let intent = parse_intent("http://localhost:9", "status of agent alpha")
             .await
             .expect("intent");
-        assert_eq!(intent.action, "create_agent");
+        assert_eq!(intent.action, "status_agent");
+        assert_eq!(
+            intent
+                .payload
+                .get("agent_index")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_rule_for_send_input() {
+        let intent = parse_intent("http://localhost:9", "tell agent 2 to run tests")
+            .await
+            .expect("intent");
+        assert_eq!(intent.action, ACTION_SEND_INPUT);
+        assert_eq!(
+            intent
+                .payload
+                .get("agent_index")
+                .and_then(|value| value.as_i64()),
+            Some(2)
+        );
+        assert_eq!(
+            intent.payload.get("input").and_then(|value| value.as_str()),
+            Some("run tests")
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_rule_for_status_overview() {
+        let intent = parse_intent("http://localhost:9", "status overview")
+            .await
+            .expect("intent");
+        assert_eq!(intent.action, ACTION_STATUS_OVERVIEW);
+        assert_eq!(
+            intent
+                .payload
+                .get("confirmed")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_rule_for_start_session() {
+        let intent = parse_intent("http://localhost:9", "start session for agent 2 with opencode")
+            .await
+            .expect("intent");
+        assert_eq!(intent.action, ACTION_START_SESSION);
+        assert_eq!(
+            intent
+                .payload
+                .get("agent_index")
+                .and_then(|value| value.as_i64()),
+            Some(2)
+        );
+        assert_eq!(
+            intent
+                .payload
+                .get("command")
+                .and_then(|value| value.as_str()),
+            Some("opencode")
+        );
+        assert!(intent.payload.get("args").is_some());
+        assert!(intent.payload.get("cwd").is_some());
+    }
+
+    #[tokio::test]
+    async fn fallback_rule_for_stop_session() {
+        let intent = parse_intent("http://localhost:9", "confirm stop session for agent alpha")
+            .await
+            .expect("intent");
+        assert_eq!(intent.action, ACTION_STOP_SESSION);
+        assert_eq!(
+            intent
+                .payload
+                .get("agent_index")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        assert_eq!(
+            intent
+                .payload
+                .get("confirmed")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_rule_for_attach_agent() {
+        let intent = parse_intent("http://localhost:9", "attach agent bravo")
+            .await
+            .expect("intent");
+        assert_eq!(intent.action, ACTION_ATTACH_AGENT);
+        assert_eq!(
+            intent
+                .payload
+                .get("agent_index")
+                .and_then(|value| value.as_i64()),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_rule_for_list_input_needed() {
+        let intent = parse_intent("http://localhost:9", "which agents need input")
+            .await
+            .expect("intent");
+        assert_eq!(intent.action, ACTION_LIST_INPUT_NEEDED);
+        assert_eq!(
+            intent
+                .payload
+                .get("confirmed")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
     }
 }

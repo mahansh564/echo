@@ -1,21 +1,70 @@
 use crate::db::models::{ManagedSession, SessionEvent, StartSessionRequest};
 use crate::db::Db;
-use crate::terminal::{TerminalManager, TerminalSession};
+use crate::terminal::TerminalManager;
+use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchProfile {
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    pub provider: Option<String>,
+    pub task_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalOutputChunk {
+    pub session_id: i64,
+    pub chunk: String,
+    pub cursor: usize,
+    pub has_more: bool,
+    pub is_delta: bool,
+    pub at: String,
+}
 
 #[tauri::command]
-pub async fn start_managed_session_cmd(
+pub async fn start_agent_session_cmd(
     app: tauri::AppHandle,
     terminal: tauri::State<'_, TerminalManager>,
     db: tauri::State<'_, Db>,
-    request: StartSessionRequest,
+    agent_id: i64,
+    launch_profile: Option<LaunchProfile>,
 ) -> Result<ManagedSession, String> {
+    let agent = db.get_agent(agent_id).await.map_err(|e| e.to_string())?;
+    let profile = launch_profile.unwrap_or(LaunchProfile {
+        command: None,
+        args: Vec::new(),
+        cwd: None,
+        provider: None,
+        task_id: None,
+    });
+
+    let command = profile
+        .command
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "opencode".to_string());
+
+    let request = StartSessionRequest {
+        command,
+        args: profile.args,
+        cwd: profile.cwd,
+        agent_id: Some(agent_id),
+        task_id: profile.task_id.or(agent.task_id),
+        provider: Some(profile.provider.unwrap_or_else(|| agent.provider.clone())),
+    };
+
     terminal
         .start_session(&app, db.inner().clone(), request)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn stop_managed_session_cmd(
+pub async fn stop_agent_session_cmd(
     terminal: tauri::State<'_, TerminalManager>,
     db: tauri::State<'_, Db>,
     session_id: i64,
@@ -47,31 +96,6 @@ pub async fn list_session_events_cmd(
         .map_err(|e| e.to_string())
 }
 
-// Deprecated compatibility command. Prefer `start_managed_session_cmd`.
-#[tauri::command]
-pub async fn start_terminal_session_cmd(
-    app: tauri::AppHandle,
-    terminal: tauri::State<'_, TerminalManager>,
-    db: tauri::State<'_, Db>,
-    agent_id: i64,
-) -> Result<TerminalSession, String> {
-    terminal
-        .start_session_legacy(&app, db.inner().clone(), agent_id)
-        .map_err(|e| e.to_string())
-}
-
-// Deprecated compatibility command. Prefer `stop_managed_session_cmd`.
-#[tauri::command]
-pub async fn stop_terminal_session_cmd(
-    terminal: tauri::State<'_, TerminalManager>,
-    db: tauri::State<'_, Db>,
-    session_id: u64,
-) -> Result<(), String> {
-    terminal
-        .stop_session_legacy(db.inner().clone(), session_id)
-        .map_err(|e| e.to_string())
-}
-
 #[tauri::command]
 pub async fn get_terminal_snippet_cmd(
     terminal: tauri::State<'_, TerminalManager>,
@@ -84,8 +108,34 @@ pub async fn get_terminal_snippet_cmd(
 pub async fn get_terminal_output_cmd(
     terminal: tauri::State<'_, TerminalManager>,
     session_id: i64,
-) -> Result<String, String> {
-    Ok(terminal.session_output(session_id).unwrap_or_default())
+    cursor: Option<usize>,
+    max_bytes: Option<usize>,
+) -> Result<TerminalOutputChunk, String> {
+    let initial_cursor = cursor.unwrap_or(0);
+    let chunk_size = max_bytes.unwrap_or(16_384).clamp(256, 65_536);
+    let (chunk, next_cursor, has_more) = terminal
+        .session_output_chunk(session_id, initial_cursor, chunk_size)
+        .unwrap_or_else(|| (String::new(), 0, false));
+    Ok(TerminalOutputChunk {
+        session_id,
+        chunk,
+        cursor: next_cursor,
+        has_more,
+        is_delta: true,
+        at: now_timestamp(),
+    })
+}
+
+#[tauri::command]
+pub async fn resize_terminal_cmd(
+    terminal: tauri::State<'_, TerminalManager>,
+    session_id: i64,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    terminal
+        .resize_session(session_id, cols.max(2), rows.max(2))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -110,4 +160,11 @@ pub async fn send_terminal_input_cmd(
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn now_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }

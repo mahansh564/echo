@@ -1,6 +1,17 @@
 use crate::commands::emit_agent_updated;
 use crate::db::models::SessionAlert;
 use crate::db::Db;
+use serde::Serialize;
+use tauri::Emitter;
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionAlertResolvedEvent {
+    alert_id: i64,
+    session_id: i64,
+    agent_id: Option<i64>,
+    resolved_at: Option<String>,
+}
 
 pub async fn list_session_alerts(
     db: &Db,
@@ -59,6 +70,15 @@ pub async fn resolve_session_alert_cmd(
     if let Some(agent_id) = alert.agent_id {
         let _ = emit_agent_updated(&app, agent_id);
     }
+    let _ = app.emit(
+        "session_alert_resolved",
+        SessionAlertResolvedEvent {
+            alert_id: alert.id,
+            session_id: alert.session_id,
+            agent_id: alert.agent_id,
+            resolved_at: alert.resolved_at.clone(),
+        },
+    );
     Ok(alert)
 }
 

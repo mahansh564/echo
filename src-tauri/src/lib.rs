@@ -56,19 +56,19 @@ pub fn run() {
             commands::agents::assign_agent_to_task_cmd,
             commands::agents::list_agents_cmd,
             commands::agents::list_agent_rows_cmd,
-            commands::terminal::start_managed_session_cmd,
-            commands::terminal::stop_managed_session_cmd,
+            commands::terminal::start_agent_session_cmd,
+            commands::terminal::stop_agent_session_cmd,
             commands::terminal::list_managed_sessions_cmd,
             commands::terminal::list_session_events_cmd,
-            commands::terminal::start_terminal_session_cmd,
-            commands::terminal::stop_terminal_session_cmd,
             commands::terminal::get_terminal_snippet_cmd,
             commands::terminal::get_terminal_output_cmd,
+            commands::terminal::resize_terminal_cmd,
             commands::terminal::send_terminal_input_cmd,
             commands::voice::start_voice_cmd,
             commands::voice::stop_voice_cmd,
             commands::voice::voice_status_cmd,
             commands::voice::process_voice_text_cmd,
+            commands::voice::push_to_talk_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

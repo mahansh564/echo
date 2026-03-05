@@ -2,10 +2,13 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
+  import { Terminal } from "@xterm/xterm";
+  import { FitAddon } from "@xterm/addon-fit";
+  import "@xterm/xterm/css/xterm.css";
   import AgentList from "$lib/components/AgentList.svelte";
   import AgentDetail from "$lib/components/AgentDetail.svelte";
 
-  type Agent = {
+  type AgentRow = {
     id: number;
     name: string;
     state: string;
@@ -25,7 +28,7 @@
     updatedAt: string;
   };
 
-  type AgentRowApi = {
+  type AgentRowPayload = {
     agentId: number;
     agentName: string;
     agentState: string;
@@ -51,7 +54,7 @@
     updatedAt: string;
   };
 
-  type ManagedSession = {
+  type SessionRuntime = {
     id: number;
     provider: string;
     status: "waking" | "active" | "stalled" | "needs_input" | "ended" | "failed";
@@ -103,23 +106,36 @@
     lastTranscript?: string | null;
   };
 
-  type ManagedSessionUpdatedEvent = {
-    sessionId: number;
-    status: ManagedSession["status"];
-    lastHeartbeatAt?: string | null;
-    agentId?: number | null;
-    taskId?: number | null;
+  type AgentRuntimeUpdatedEvent = {
+    agentId: number;
+    activeSessionId?: number | null;
+    status: SessionRuntime["status"];
+    attentionState: string;
+    lastActivityAt?: string | null;
   };
 
   type ManagedSessionPromptRequiredEvent = {
     reason: "missing_command" | string;
     source: "voice" | "ui" | string;
+    action?: string;
+    message?: string;
   };
 
-  type TerminalSnippetEvent = {
-    agentId?: number | null;
+  type TerminalChunkEvent = {
     sessionId: number;
-    snippet: string;
+    chunk: string;
+    cursor: number;
+    isDelta: boolean;
+    at: string;
+  };
+
+  type TerminalOutputChunk = {
+    sessionId: number;
+    chunk: string;
+    cursor: number;
+    hasMore: boolean;
+    isDelta: boolean;
+    at: string;
   };
 
   type VoiceIntentEvent = {
@@ -127,21 +143,30 @@
     payload: Record<string, unknown>;
   };
 
-  type VoiceCommandExecutedEvent = {
+  type VoiceAction = {
     action: string;
-    success: boolean;
-    result: unknown;
+    targetAgentId?: number | null;
+    targetSessionId?: number | null;
+    text?: string | null;
+    result: string;
+    at: string;
   };
 
   type VoiceStatusReplyEvent = {
-    text: string;
-    query: string;
-    resolved: Record<string, unknown>;
+    requestType: string;
+    targetAgentId?: number | null;
+    summary: string;
+    at: string;
   };
 
-  let agents = $state<Agent[]>([]);
+  type TerminalViewportState = {
+    selectedSessionId: number | null;
+    cursors: Map<number, number>;
+  };
+
+  let agents = $state<AgentRow[]>([]);
   let tasks = $state<Task[]>([]);
-  let sessions = $state<ManagedSession[]>([]);
+  let sessions = $state<SessionRuntime[]>([]);
   let selectedAgentId = $state<number>(0);
   let loading = $state<boolean>(true);
   let voiceRunning = $state<boolean>(false);
@@ -150,12 +175,24 @@
   let lastIntent = $state<string>("");
   let lastCommand = $state<string>("");
   let voiceInput = $state<string>("");
+  let lastVoiceCommandText = $state<string>("");
+  let pushToTalkBusy = $state<boolean>(false);
   let sessionEvents = $state<SessionEvent[]>([]);
   let unresolvedAlerts = $state<SessionAlert[]>([]);
   let sessionEventsFor = $state<number | null>(null);
   let selectedSessionId = $state<number | null>(null);
-  let liveTerminalOutput = $state<string>("");
   let terminalInput = $state<string>("");
+  let terminalContainer: HTMLDivElement | null = $state(null);
+
+  let terminalWidget: Terminal | null = null;
+  let fitAddon: FitAddon | null = null;
+  const terminalViewportState: TerminalViewportState = {
+    selectedSessionId: null,
+    cursors: new Map<number, number>()
+  };
+  const terminalCursorBySession = terminalViewportState.cursors;
+  const TERMINAL_CHUNK_BYTES = 16_384;
+  const TERMINAL_MAX_DRAIN_ITERATIONS = 8;
 
   const selectedAgent = $derived(
     agents.find((agent) => agent.id === selectedAgentId)
@@ -186,6 +223,16 @@
     selectedSessionId ? sessions.find((session) => session.id === selectedSessionId) : undefined
   );
 
+  const pendingAckAgentIds = $derived(
+    Array.from(
+      new Set(
+        unresolvedAlerts
+          .filter((alert) => alert.requiresAck && !alert.acknowledgedAt && alert.agentId)
+          .map((alert) => alert.agentId as number)
+      )
+    )
+  );
+
   const formatRelativeTime = (value: string | null | undefined) => {
     if (!value) return "-";
     const normalized = value.includes("T") ? value : value.replace(" ", "T") + "Z";
@@ -202,7 +249,7 @@
   };
 
   const applyRelativeTimes = (
-    list: Agent[],
+    list: AgentRow[],
     taskList: Task[],
     alertList: SessionAlert[]
   ) => {
@@ -238,7 +285,7 @@
           limit: 200
         })
       ]);
-      const mappedAgents = (agentRowsResponse as AgentRowApi[]).map((row) => ({
+      const mappedAgents = (agentRowsResponse as AgentRowPayload[]).map((row) => ({
         id: row.agentId,
         name: row.agentName,
         state: row.agentState,
@@ -261,7 +308,7 @@
         tasksResponse as Task[],
         alertsResponse as SessionAlert[]
       );
-      sessions = sessionsResponse as ManagedSession[];
+      sessions = sessionsResponse as SessionRuntime[];
       if (!selectedSessionId && sessions.length > 0) {
         selectedSessionId = sessions[0].id;
       }
@@ -269,9 +316,9 @@
         selectedSessionId = sessions.length > 0 ? sessions[0].id : null;
       }
       if (selectedSessionId) {
-        void loadTerminalOutput(selectedSessionId);
+        void hydrateTerminalSession(selectedSessionId, { reset: true });
       } else {
-        liveTerminalOutput = "";
+        clearTerminalView();
       }
       if (agents.length > 0 && !agents.some((agent) => agent.id === selectedAgentId)) {
         selectedAgentId = agents[0].id;
@@ -294,13 +341,14 @@
     const value = window.prompt("Command to start session", initial ?? "opencode");
     const command = value?.trim();
     if (!command) return;
+    if (!agentId) return;
     try {
-      await invoke("start_managed_session_cmd", {
-        request: {
+      await invoke("start_agent_session_cmd", {
+        agentId,
+        launchProfile: {
           command,
           args: [],
           cwd: null,
-          agentId: agentId ?? null,
           taskId: taskId ?? null,
           provider: "opencode"
         }
@@ -318,14 +366,14 @@
 
   async function stopSession(sessionId: number) {
     try {
-      await invoke("stop_managed_session_cmd", { sessionId });
+      await invoke("stop_agent_session_cmd", { sessionId });
       await loadData();
     } catch (error) {
       console.error("Failed to stop session", error);
     }
   }
 
-  async function restartSession(session: ManagedSession) {
+  async function restartSession(session: SessionRuntime) {
     await stopSession(session.id);
     await startSessionPrompt(session.agentId ?? undefined, session.taskId ?? undefined, session.launchCommand);
   }
@@ -346,9 +394,90 @@
   const lookupAgentName = (agentId?: number | null) =>
     agents.find((agent) => agent.id === agentId)?.name ?? "Unassigned";
 
+  const findSessionForAgent = (agentId: number) =>
+    sessions.find((session) => session.id === agents.find((agent) => agent.id === agentId)?.activeSessionId) ??
+    sessions.find(
+      (session) =>
+        session.agentId === agentId &&
+        ["waking", "active", "stalled", "needs_input"].includes(session.status)
+    );
+
+  const focusAgentById = (agentId: number, preferredSessionId?: number | null) => {
+    const target = agents.find((agent) => agent.id === agentId);
+    if (!target) return;
+    selectedAgentId = target.id;
+    if (preferredSessionId) {
+      selectedSessionId = preferredSessionId;
+      void hydrateTerminalSession(preferredSessionId, { reset: true });
+      return;
+    }
+    const fallbackSession = findSessionForAgent(target.id);
+    if (fallbackSession) {
+      selectedSessionId = fallbackSession.id;
+      void hydrateTerminalSession(fallbackSession.id, { reset: true });
+    }
+  };
+
   function focusSession(sessionId: number) {
     selectedSessionId = sessionId;
-    void loadTerminalOutput(sessionId);
+    const session = sessions.find((entry) => entry.id === sessionId);
+    if (session?.agentId) {
+      selectedAgentId = session.agentId;
+    }
+    void hydrateTerminalSession(sessionId, { reset: true });
+  }
+
+  async function attachFromAgent(agentId: number) {
+    focusAgentById(agentId);
+    const active = findSessionForAgent(agentId);
+    if (active) {
+      focusSession(active.id);
+      return;
+    }
+    const agent = agents.find((entry) => entry.id === agentId);
+    await startSessionPrompt(agentId, agent?.taskId ?? undefined);
+  }
+
+  async function replyFromAgent(agentId: number) {
+    focusAgentById(agentId);
+    const active = findSessionForAgent(agentId);
+    if (!active) return;
+    const text = window.prompt(`Reply to ${agents.find((entry) => entry.id === agentId)?.name ?? "agent"}`);
+    const payload = text?.trim();
+    if (!payload) return;
+    await invoke("send_terminal_input_cmd", {
+      sessionId: active.id,
+      input: payload.endsWith("\n") ? payload : `${payload}\n`
+    });
+    if (selectedSessionId === active.id) {
+      await streamTerminalChunks(active.id);
+    }
+  }
+
+  async function acknowledgeFromAgent(agentId: number) {
+    const alert = unresolvedAlerts.find(
+      (entry) =>
+        entry.agentId === agentId && entry.requiresAck && !entry.acknowledgedAt && !entry.resolvedAt
+    );
+    if (!alert) return;
+    await acknowledgeAlert(alert.id);
+    focusAgentById(agentId, alert.sessionId);
+  }
+
+  function handleGlobalAgentNavigation(event: KeyboardEvent) {
+    const target = event.target as HTMLElement | null;
+    if (!target) return;
+    const tagName = target.tagName.toLowerCase();
+    if (tagName === "input" || tagName === "textarea" || target.isContentEditable) return;
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    if (agents.length === 0) return;
+    event.preventDefault();
+    const currentIndex = Math.max(0, agents.findIndex((agent) => agent.id === selectedAgentId));
+    const nextIndex =
+      event.key === "ArrowDown"
+        ? Math.min(agents.length - 1, currentIndex + 1)
+        : Math.max(0, currentIndex - 1);
+    focusAgentById(agents[nextIndex].id);
   }
 
   async function acknowledgeAlert(alertId: number) {
@@ -369,15 +498,50 @@
     }
   }
 
-  async function loadTerminalOutput(sessionId: number) {
-    try {
-      const output = (await invoke("get_terminal_output_cmd", {
-        sessionId
-      })) as string;
-      liveTerminalOutput = output || "";
-    } catch (error) {
-      console.error("Failed to load terminal output", error);
+  function clearTerminalView() {
+    terminalWidget?.clear();
+    terminalWidget?.reset();
+    if (terminalWidget) {
+      terminalWidget.write("No terminal output yet.\r\n");
     }
+  }
+
+  async function streamTerminalChunks(sessionId: number) {
+    let cursor = terminalCursorBySession.get(sessionId) ?? 0;
+    try {
+      for (let i = 0; i < TERMINAL_MAX_DRAIN_ITERATIONS; i += 1) {
+        const payload = (await invoke("get_terminal_output_cmd", {
+          sessionId,
+          cursor,
+          maxBytes: TERMINAL_CHUNK_BYTES
+        })) as TerminalOutputChunk;
+        if (!payload.chunk) {
+          cursor = payload.cursor;
+          break;
+        }
+        cursor = payload.cursor;
+        if (selectedSessionId === sessionId && terminalWidget) {
+          terminalWidget.write(payload.chunk);
+        }
+        if (!payload.hasMore) {
+          break;
+        }
+      }
+      terminalCursorBySession.set(sessionId, cursor);
+    } catch (error) {
+      console.error("Failed to stream terminal output", error);
+    }
+  }
+
+  async function hydrateTerminalSession(sessionId: number, options: { reset?: boolean } = {}) {
+    const { reset = false } = options;
+    if (reset) {
+      terminalWidget?.clear();
+      terminalWidget?.reset();
+      terminalCursorBySession.set(sessionId, 0);
+    }
+    await streamTerminalChunks(sessionId);
+    await resizeTerminalSession(sessionId);
   }
 
   async function sendTerminalInput() {
@@ -390,6 +554,7 @@
         input: payload
       });
       terminalInput = "";
+      await streamTerminalChunks(selectedSessionId);
     } catch (error) {
       console.error("Failed to send terminal input", error);
     }
@@ -408,7 +573,7 @@
   async function createAgent() {
     const name = `Agent ${agents.length + 1}`;
     try {
-      const agent = (await invoke("create_agent_cmd", { name })) as Agent;
+      const agent = (await invoke("create_agent_cmd", { name })) as { id: number };
       await loadData();
       selectedAgentId = agent.id;
     } catch (error) {
@@ -436,16 +601,118 @@
     }
   }
 
+  async function runVoiceText(
+    text: string,
+    options: { pushToTalk?: boolean; confirmed?: boolean } = {}
+  ) {
+    const { pushToTalk = false, confirmed = false } = options;
+    const transcript = confirmed ? `confirm ${text}` : text;
+    let startedTemporarily = false;
+    if (pushToTalk && !voiceRunning) {
+      const status = (await invoke("start_voice_cmd")) as VoiceStatus;
+      voiceRunning = status.running;
+      voiceState = status.state;
+      startedTemporarily = true;
+    }
+    if (!text) return;
+    try {
+      if (pushToTalk) {
+        pushToTalkBusy = true;
+      }
+      await invoke("process_voice_text_cmd", { text: transcript });
+    } catch (error) {
+      console.error("Failed to process voice text", error);
+    } finally {
+      if (startedTemporarily) {
+        const status = (await invoke("stop_voice_cmd")) as VoiceStatus;
+        voiceRunning = status.running;
+        voiceState = status.state;
+      }
+      if (pushToTalk) {
+        pushToTalkBusy = false;
+      }
+    }
+  }
+
   async function submitVoiceText() {
     const text = voiceInput.trim();
     if (!text) return;
+    await runVoiceText(text);
+    voiceInput = "";
+  }
+
+  async function pushToTalkVoiceText() {
+    if (pushToTalkBusy) return;
+    pushToTalkBusy = true;
     try {
-      await invoke("process_voice_text_cmd", { text });
-      voiceInput = "";
+      await invoke("push_to_talk_cmd");
     } catch (error) {
-      console.error("Failed to process voice text", error);
+      console.error("Failed to run push-to-talk command", error);
+    } finally {
+      pushToTalkBusy = false;
+      invoke("voice_status_cmd")
+        .then((status) => {
+          const typed = status as VoiceStatus;
+          voiceRunning = typed.running;
+          voiceState = typed.state;
+          lastTranscript = typed.lastTranscript ?? lastTranscript;
+        })
+        .catch((error) => {
+          console.error("Failed to refresh voice status", error);
+        });
     }
   }
+
+  async function initTerminalWidget() {
+    if (!terminalContainer) return;
+    try {
+      fitAddon = new FitAddon();
+      terminalWidget = new Terminal({
+        cursorBlink: true,
+        convertEol: true,
+        fontFamily: '"JetBrains Mono", "Menlo", monospace',
+        fontSize: 12,
+        lineHeight: 1.35,
+        theme: {
+          background: "#07090d",
+          foreground: "#f4f2ee",
+          cursor: "#ff9f43"
+        }
+      });
+      terminalWidget.loadAddon(fitAddon);
+      terminalWidget.open(terminalContainer);
+      fitAddon.fit();
+      clearTerminalView();
+      if (selectedSessionId) {
+        await resizeTerminalSession(selectedSessionId);
+      }
+    } catch (error) {
+      console.error("Failed to initialize terminal widget", error);
+      terminalContainer.textContent =
+        "Terminal widget unavailable. Install xterm dependencies to enable attach.";
+    }
+  }
+
+  async function resizeTerminalSession(sessionId: number) {
+    if (!terminalWidget) return;
+    const cols = terminalWidget.cols;
+    const rows = terminalWidget.rows;
+    if (cols < 2 || rows < 2) return;
+    try {
+      await invoke("resize_terminal_cmd", { sessionId, cols, rows });
+    } catch (error) {
+      console.error("Failed to resize terminal session", error);
+    }
+  }
+
+  $effect(() => {
+    if (!selectedSessionId) {
+      sessionEventsFor = null;
+      sessionEvents = [];
+      return;
+    }
+    void openSessionLogs(selectedSessionId);
+  });
 
   onMount(() => {
     let unlistenTask: (() => void) | undefined;
@@ -459,6 +726,9 @@
     let unlistenVoiceCommand: (() => void) | undefined;
     let unlistenVoiceError: (() => void) | undefined;
     let unlistenVoiceReply: (() => void) | undefined;
+    let unlistenAlertResolved: (() => void) | undefined;
+
+    void initTerminalWidget();
 
     const startListeners = async () => {
       unlistenTask = await listen("task_updated", () => {
@@ -467,41 +737,32 @@
       unlistenAgent = await listen("agent_updated", () => {
         loadData();
       });
-      unlistenTerminal = await listen("terminal_snippet_updated", (event) => {
-        const payload = event.payload as TerminalSnippetEvent;
-        if (payload.agentId) {
-          agents = agents.map((agent) =>
-            agent.id === payload.agentId
-              ? {
-                  ...agent,
-                  lastSnippet: payload.snippet,
-                  lastActivityAt: "just now",
-                  updatedAt: "just now"
-                }
-              : agent
-          );
-        }
-        if (selectedSessionId === payload.sessionId) {
-          liveTerminalOutput = `${liveTerminalOutput}${payload.snippet}`.slice(-500000);
+      unlistenTerminal = await listen("terminal_chunk", (event) => {
+        const payload = event.payload as TerminalChunkEvent;
+        terminalCursorBySession.set(payload.sessionId, payload.cursor);
+        if (selectedSessionId === payload.sessionId && terminalWidget && payload.chunk) {
+          terminalWidget.write(payload.chunk);
         }
       });
-      unlistenSession = await listen("managed_session_updated", (event) => {
-        const payload = event.payload as ManagedSessionUpdatedEvent;
-        sessions = sessions.map((session) =>
-          session.id === payload.sessionId
-            ? {
-                ...session,
-                status: payload.status,
-                lastHeartbeatAt: payload.lastHeartbeatAt ?? session.lastHeartbeatAt
-              }
-            : session
-        );
+      unlistenSession = await listen("agent_runtime_updated", (event) => {
+        const payload = event.payload as AgentRuntimeUpdatedEvent;
+        if (payload.activeSessionId && selectedAgentId === payload.agentId) {
+          selectedSessionId = payload.activeSessionId;
+        }
         void loadData();
       });
       unlistenSessionPrompt = await listen("managed_session_prompt_required", async (event) => {
         const payload = event.payload as ManagedSessionPromptRequiredEvent;
         if (payload.reason === "missing_command") {
-          await startSessionPrompt();
+          await startSessionPrompt(selectedAgentId || undefined);
+          return;
+        }
+        if (payload.reason === "confirmation_required" && payload.source === "voice") {
+          const candidate = lastVoiceCommandText.trim() || voiceInput.trim();
+          if (!candidate) return;
+          const ok = window.confirm(payload.message ?? "Voice command requires confirmation.");
+          if (!ok) return;
+          await runVoiceText(candidate, { pushToTalk: true, confirmed: true });
         }
       });
       unlistenVoiceState = await listen("voice_state_updated", (event) => {
@@ -511,14 +772,18 @@
       unlistenVoiceTranscript = await listen("voice_transcript", (event) => {
         const payload = event.payload as { text: string };
         lastTranscript = payload.text;
+        lastVoiceCommandText = payload.text;
       });
       unlistenVoiceIntent = await listen("voice_intent", (event) => {
         const payload = event.payload as VoiceIntentEvent;
         lastIntent = `${payload.action} ${JSON.stringify(payload.payload)}`;
       });
-      unlistenVoiceCommand = await listen("voice_command_executed", (event) => {
-        const payload = event.payload as VoiceCommandExecutedEvent;
-        lastCommand = `${payload.action} (${payload.success ? "ok" : "failed"})`;
+      unlistenVoiceCommand = await listen("voice_action_executed", (event) => {
+        const payload = event.payload as VoiceAction;
+        lastCommand = `${payload.action} (${payload.result})`;
+        if (payload.targetAgentId) {
+          focusAgentById(payload.targetAgentId, payload.targetSessionId ?? undefined);
+        }
         loadData();
       });
       unlistenVoiceError = await listen("voice_error", (event) => {
@@ -527,7 +792,13 @@
       });
       unlistenVoiceReply = await listen("voice_status_reply", (event) => {
         const payload = event.payload as VoiceStatusReplyEvent;
-        lastCommand = payload.text;
+        lastCommand = payload.summary;
+        if (payload.targetAgentId) {
+          focusAgentById(payload.targetAgentId);
+        }
+      });
+      unlistenAlertResolved = await listen("session_alert_resolved", () => {
+        void loadData();
       });
     };
 
@@ -547,13 +818,33 @@
     loadData();
     const outputInterval = setInterval(() => {
       if (selectedSessionId) {
-        void loadTerminalOutput(selectedSessionId);
+        void streamTerminalChunks(selectedSessionId);
       }
-    }, 5000);
+    }, 300);
+
+    const resizeObserver =
+      typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(() => {
+            fitAddon?.fit();
+            if (selectedSessionId) {
+              void resizeTerminalSession(selectedSessionId);
+            }
+          })
+        : null;
+    if (resizeObserver && terminalContainer) {
+      resizeObserver.observe(terminalContainer);
+    }
+
+    window.addEventListener("keydown", handleGlobalAgentNavigation);
 
     return () => {
       clearInterval(interval);
       clearInterval(outputInterval);
+      resizeObserver?.disconnect();
+      terminalWidget?.dispose();
+      terminalWidget = null;
+      fitAddon = null;
+      window.removeEventListener("keydown", handleGlobalAgentNavigation);
       unlistenTask?.();
       unlistenAgent?.();
       unlistenTerminal?.();
@@ -565,6 +856,7 @@
       unlistenVoiceCommand?.();
       unlistenVoiceError?.();
       unlistenVoiceReply?.();
+      unlistenAlertResolved?.();
     };
   });
 </script>
@@ -583,7 +875,9 @@
     <div class="header-actions">
       <button class="ghost" onclick={createTask}>New task</button>
       <button class="primary" onclick={createAgent}>Spawn agent</button>
-      <button class="ghost" onclick={() => startSessionPrompt()}>Start session</button>
+      <button class="ghost" onclick={() => startSessionPrompt(selectedAgentId || undefined)}>
+        Start session
+      </button>
       {#if voiceRunning}
         <button class="ghost" onclick={stopVoice}>Stop voice</button>
       {:else}
@@ -595,10 +889,13 @@
   <section class="voice-panel">
     <input
       bind:value={voiceInput}
-      placeholder="Test transcript (bridge until mic capture is wired)"
+      placeholder="Type a test transcript (optional)"
       onkeydown={(event) => event.key === "Enter" && submitVoiceText()}
     />
     <button class="primary" onclick={submitVoiceText}>Run voice command</button>
+    <button class="ghost" onclick={pushToTalkVoiceText} disabled={pushToTalkBusy}>
+      {pushToTalkBusy ? "Push-to-talk running..." : "Push to talk"}
+    </button>
     <p>Transcript: {lastTranscript || "none"}</p>
     <p>Intent: {lastIntent || "none"}</p>
     <p>Command: {lastCommand || "none"}</p>
@@ -608,7 +905,11 @@
     <AgentList
       {agents}
       selectedId={selectedAgentId}
-      onSelect={(id: number) => (selectedAgentId = id)}
+      onSelect={focusAgentById}
+      onAttach={attachFromAgent}
+      onReply={replyFromAgent}
+      onAcknowledge={acknowledgeFromAgent}
+      {pendingAckAgentIds}
     />
     <AgentDetail
       agent={selectedAgent}
@@ -625,6 +926,38 @@
           : undefined
       }
     />
+  </section>
+
+  <section class="timeline-panel">
+    <header>
+      <h2>Session timeline</h2>
+      <span>
+        {#if selectedSession}
+          Session #{selectedSession.id}
+        {:else}
+          No session selected
+        {/if}
+      </span>
+    </header>
+    {#if !selectedSession}
+      <p class="empty-timeline">Select an agent with a session to inspect timeline events.</p>
+    {:else if sessionEvents.length === 0}
+      <p class="empty-timeline">No events yet for this session.</p>
+    {:else}
+      <div class="timeline-list">
+        {#each sessionEvents as event}
+          <article class="timeline-item">
+            <p class="timeline-head">
+              <strong>{event.eventType}</strong>
+              <span>{formatRelativeTime(event.createdAt)}</span>
+            </p>
+            {#if event.message}
+              <p>{event.message}</p>
+            {/if}
+          </article>
+        {/each}
+      </div>
+    {/if}
   </section>
 
   <section class="alerts-panel">
@@ -708,21 +1041,6 @@
       {/if}
     </div>
 
-    {#if sessionEventsFor}
-      <div class="logs">
-        <h3>Session #{sessionEventsFor} logs</h3>
-        {#if sessionEvents.length === 0}
-          <p>No events.</p>
-        {:else}
-          {#each sessionEvents as event}
-            <p>
-              <strong>{event.eventType}</strong> [{formatRelativeTime(event.createdAt)}]
-              {event.message ?? ""}
-            </p>
-          {/each}
-        {/if}
-      </div>
-    {/if}
   </section>
 
   <section class="terminal-panel">
@@ -730,7 +1048,7 @@
       <h2>Live terminal</h2>
       <span>{selectedSession ? `Session #${selectedSession.id}` : "No session selected"}</span>
     </header>
-    <pre>{liveTerminalOutput || "No terminal output yet."}</pre>
+    <div class="terminal-widget" bind:this={terminalContainer}></div>
     {#if selectedAgent && selectedAgentAlerts.length > 0}
       <div class="selected-agent-alerts">
         <p>Selected agent unresolved alerts: {selectedAgentAlerts.length}</p>
@@ -982,16 +1300,57 @@
     flex-wrap: wrap;
   }
 
-  .logs {
-    margin-top: 12px;
-    border-top: 1px solid rgba(255, 255, 255, 0.1);
-    padding-top: 10px;
+  .timeline-panel {
+    margin-top: 20px;
+    padding: 16px;
+    border-radius: 16px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
   }
 
-  .logs p {
-    margin: 6px 0;
+  .timeline-panel header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+
+  .timeline-list {
+    display: grid;
+    gap: 8px;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+
+  .timeline-item {
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+
+  .timeline-head {
+    margin: 0 0 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+  }
+
+  .timeline-head span {
+    color: rgba(244, 242, 238, 0.55);
+    font-size: 12px;
+  }
+
+  .timeline-item p {
+    margin: 0;
     font-size: 13px;
     color: rgba(244, 242, 238, 0.78);
+  }
+
+  .empty-timeline {
+    margin: 0;
+    color: rgba(244, 242, 238, 0.7);
   }
 
   .terminal-panel {
@@ -1009,19 +1368,22 @@
     margin-bottom: 10px;
   }
 
-  .terminal-panel pre {
+  .terminal-widget {
     margin: 0 0 12px;
     height: 260px;
     overflow: auto;
     background: #07090d;
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 12px;
-    padding: 12px;
-    color: rgba(244, 242, 238, 0.9);
-    font-family: "JetBrains Mono", "Menlo", monospace;
-    font-size: 12px;
-    line-height: 1.45;
-    white-space: pre-wrap;
+    padding: 6px;
+  }
+
+  :global(.terminal-widget .xterm) {
+    height: 100%;
+  }
+
+  :global(.terminal-widget .xterm-viewport) {
+    border-radius: 8px;
   }
 
   .terminal-input-row {

@@ -19,6 +19,44 @@ fn pty_spawns() {
     assert!(snippet.contains("hello"));
 }
 
+#[test]
+fn output_chunk_cursor_advances() {
+    let manager = TerminalManager::new();
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let session = match manager.start_session_for_test(&shell, &["-lc", "printf hello-world"]) {
+        Ok(session) => session,
+        Err(err) => {
+            eprintln!("skipping chunk test: {err}");
+            return;
+        }
+    };
+    thread::sleep(Duration::from_millis(200));
+    let first = manager
+        .session_output_chunk(session.id as i64, 0, 5)
+        .expect("chunk");
+    assert!(!first.0.is_empty());
+    let second = manager
+        .session_output_chunk(session.id as i64, first.1, 1024)
+        .expect("chunk");
+    assert!(second.1 >= first.1);
+}
+
+#[test]
+fn resize_session_succeeds() {
+    let manager = TerminalManager::new();
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let session = match manager.start_session_for_test(&shell, &["-lc", "echo resize"]) {
+        Ok(session) => session,
+        Err(err) => {
+            eprintln!("skipping resize test: {err}");
+            return;
+        }
+    };
+    manager
+        .resize_session(session.id as i64, 100, 32)
+        .expect("resize");
+}
+
 #[tokio::test]
 async fn reconcile_orphan_sessions_marks_open_rows_failed() {
     let db = Db::connect("sqlite::memory:").await.expect("db");

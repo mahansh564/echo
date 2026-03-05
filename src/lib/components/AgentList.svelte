@@ -1,5 +1,5 @@
 <script lang="ts">
-  export let agents: {
+  type AgentRow = {
     id: number;
     name: string;
     state: string;
@@ -14,10 +14,56 @@
     lastActivityAt?: string | null;
     lastSnippet?: string | null;
     updatedAt: string;
-  }[] = [];
+  };
+
+  export let agents: AgentRow[] = [];
 
   export let selectedId: number | null = null;
   export let onSelect: (id: number) => void;
+  export let onAttach: ((id: number) => void) | undefined;
+  export let onReply: ((id: number) => void) | undefined;
+  export let onAcknowledge: ((id: number) => void) | undefined;
+  export let pendingAckAgentIds: number[] = [];
+
+  const toTitleCase = (value: string) =>
+    value
+      .split(/[_\s-]+/)
+      .filter(Boolean)
+      .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+      .join(" ");
+
+  const isInputNeeded = (agent: AgentRow) =>
+    !!agent.activeSessionNeedsInput || agent.unresolvedAlertCount > 0;
+
+  const selectByOffset = (offset: number) => {
+    if (agents.length === 0) return;
+    const index = Math.max(0, agents.findIndex((agent) => agent.id === selectedId));
+    const next = Math.min(agents.length - 1, Math.max(0, index + offset));
+    onSelect?.(agents[next].id);
+  };
+
+  function handleRailKeydown(event: KeyboardEvent) {
+    if (agents.length === 0) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      selectByOffset(1);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      selectByOffset(-1);
+      return;
+    }
+    if (event.key === "Home") {
+      event.preventDefault();
+      onSelect?.(agents[0].id);
+      return;
+    }
+    if (event.key === "End") {
+      event.preventDefault();
+      onSelect?.(agents[agents.length - 1].id);
+    }
+  }
 </script>
 
 <section class="panel">
@@ -31,37 +77,62 @@
       <p>No agents yet. Spawn an agent to begin.</p>
     </div>
   {:else}
-    <div class="table">
-      <div class="row header">
-        <span>Agent</span>
-        <span>Status</span>
-        <span>Task</span>
-        <span>Activity</span>
-        <span>Attention</span>
-        <span>Snippet</span>
-      </div>
+    <div
+      class="rail"
+      tabindex="0"
+      role="listbox"
+      aria-label="Agent runtime rail"
+      on:keydown={handleRailKeydown}
+    >
       {#each agents as agent}
-        <button
-          type="button"
+        <div
+          role="option"
+          tabindex="0"
+          aria-selected={agent.id === selectedId}
           class:selected={agent.id === selectedId}
-          class="row"
+          class="card"
           on:click={() => onSelect?.(agent.id)}
+          on:keydown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              onSelect?.(agent.id);
+            }
+          }}
         >
-          <span class="name">
-            {agent.name}
-            <small>{agent.provider}</small>
+          <span class="card-head">
+            <span class="identity">
+              <strong>{agent.name}</strong>
+              <small>{agent.provider}</small>
+            </span>
+            <span class="status {agent.activeSessionStatus ?? agent.state}">
+              {toTitleCase(agent.activeSessionStatus ?? agent.state)}
+            </span>
           </span>
-          <span class="state {agent.state}">{agent.state}</span>
-          <span class="task">{agent.taskTitle ?? "—"}</span>
-          <span class="updated">{agent.lastActivityAt ?? agent.updatedAt}</span>
-          <span class="attention {agent.attentionState}">
-            {agent.activeSessionNeedsInput || agent.unresolvedAlertCount > 0 ? "needs input" : agent.attentionState}
+          <span class="task">Task: {agent.taskTitle ?? "Unassigned"}</span>
+          <span class="activity">Last activity: {agent.lastActivityAt ?? agent.updatedAt}</span>
+          <span class="attention {isInputNeeded(agent) ? "needs_input" : agent.attentionState}">
+            {isInputNeeded(agent) ? "Needs input" : toTitleCase(agent.attentionState)}
             {#if agent.unresolvedAlertCount > 0}
               <strong>({agent.unresolvedAlertCount})</strong>
             {/if}
           </span>
-          <span class="snippet">{agent.lastSnippet ?? "—"}</span>
-        </button>
+          <span class="snippet">{agent.lastSnippet ?? "Waiting for terminal output..."}</span>
+          <span class="actions">
+            <button class="ghost small" on:click|stopPropagation={() => onAttach?.(agent.id)}>
+              Attach
+            </button>
+            <button class="ghost small" on:click|stopPropagation={() => onReply?.(agent.id)}>
+              Reply
+            </button>
+            <button
+              class="primary small"
+              disabled={!pendingAckAgentIds.includes(agent.id)}
+              on:click|stopPropagation={() => onAcknowledge?.(agent.id)}
+            >
+              Acknowledge
+            </button>
+          </span>
+        </div>
       {/each}
     </div>
   {/if}
@@ -95,12 +166,18 @@
     color: rgba(244, 242, 238, 0.5);
   }
 
-  .table {
+  .rail {
     display: grid;
-    gap: 6px;
+    gap: 10px;
     max-height: 520px;
     overflow-y: auto;
     padding-right: 4px;
+  }
+
+  .rail:focus-visible {
+    outline: 2px solid rgba(123, 223, 242, 0.6);
+    outline-offset: 8px;
+    border-radius: 18px;
   }
 
   .empty {
@@ -111,11 +188,9 @@
     text-align: center;
   }
 
-  .row {
+  .card {
     display: grid;
-    grid-template-columns: 1.2fr 0.75fr 1.2fr 0.8fr 1fr 1.2fr;
-    align-items: center;
-    gap: 12px;
+    gap: 10px;
     padding: 12px 14px;
     border-radius: 16px;
     background: rgba(255, 255, 255, 0.02);
@@ -124,63 +199,78 @@
     text-align: left;
   }
 
-  .row.header {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.16em;
-    color: rgba(244, 242, 238, 0.4);
-    background: transparent;
-  }
-
-  button.row {
+  .card {
     cursor: pointer;
     transition: border 0.2s ease, background 0.2s ease;
   }
 
-  button.row:hover {
+  .card:hover {
     background: rgba(255, 255, 255, 0.06);
   }
 
-  button.row.selected {
+  .card.selected {
     border-color: rgba(255, 159, 67, 0.6);
     background: rgba(255, 159, 67, 0.08);
   }
 
-  .name {
+  .card:focus-visible {
+    outline: 2px solid rgba(123, 223, 242, 0.6);
+    outline-offset: 2px;
+  }
+
+  .card-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    align-items: baseline;
+  }
+
+  .identity {
     display: flex;
     flex-direction: column;
+    gap: 2px;
+  }
+
+  .identity strong {
     font-weight: 600;
   }
 
-  .name small {
+  .identity small {
     color: rgba(244, 242, 238, 0.55);
     font-size: 11px;
     font-weight: 500;
     text-transform: uppercase;
     letter-spacing: 0.12em;
-    margin-top: 2px;
   }
 
-  .state {
+  .status {
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.14em;
   }
 
-  .state.running {
+  .status.active,
+  .status.running {
     color: #ffd166;
   }
 
-  .state.idle {
+  .status.waking,
+  .status.idle {
     color: #7bdff2;
   }
 
-  .state.blocked {
+  .status.needs_input,
+  .status.failed,
+  .status.blocked {
     color: #ef476f;
   }
 
+  .status.ended {
+    color: rgba(244, 242, 238, 0.5);
+  }
+
   .task,
-  .updated,
+  .activity,
   .attention,
   .snippet {
     color: rgba(244, 242, 238, 0.7);
@@ -212,5 +302,34 @@
 
   .snippet {
     font-family: "JetBrains Mono", "Menlo", monospace;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    overflow: hidden;
+  }
+
+  .actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .small {
+    padding: 6px 10px;
+    font-size: 12px;
+  }
+
+  .ghost {
+    background: rgba(255, 255, 255, 0.08);
+    color: #f4f2ee;
+  }
+
+  .primary {
+    background: linear-gradient(120deg, #ff9f43, #ff6b6b);
+    color: #120c08;
+  }
+
+  button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 </style>

@@ -5,6 +5,7 @@ use std::sync::{
 
 use anyhow::{anyhow, Result};
 use serde::Serialize;
+use serde_json::Value;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter};
 
@@ -63,8 +64,11 @@ struct VoiceIntentEvent {
 #[serde(rename_all = "camelCase")]
 struct VoiceCommandExecutedEvent {
     action: String,
-    success: bool,
-    result: serde_json::Value,
+    target_agent_id: Option<i64>,
+    target_session_id: Option<i64>,
+    text: Option<String>,
+    result: String,
+    at: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -75,9 +79,10 @@ struct VoiceErrorEvent {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VoiceStatusReplyEvent {
-    text: String,
-    query: String,
-    resolved: serde_json::Value,
+    request_type: String,
+    target_agent_id: Option<i64>,
+    summary: String,
+    at: String,
 }
 
 #[derive(Default)]
@@ -210,6 +215,31 @@ impl VoiceManager {
         self.set_state(app, VoiceRuntimeState::Transcribing)?;
         self.handle_transcript(app, db, terminal, config, transcript)
             .await
+    }
+
+    pub async fn process_push_to_talk(
+        &self,
+        app: &AppHandle,
+        db: &Db,
+        terminal: &TerminalManager,
+        config: &EchoConfig,
+    ) -> Result<serde_json::Value> {
+        let was_running = {
+            let inner = self.inner.lock().unwrap();
+            inner.running
+        };
+
+        self.set_state(app, VoiceRuntimeState::Listening)?;
+        let transcript = self.capture_command_transcript(config).await?;
+        let result = self
+            .handle_transcript(app, db, terminal, config, transcript)
+            .await;
+
+        if !was_running {
+            self.set_state(app, VoiceRuntimeState::Idle)?;
+        }
+
+        result
     }
 
     async fn background_loop(
@@ -384,55 +414,84 @@ impl VoiceManager {
             router::execute_command(app, db, terminal, &config.model_endpoint, &parsed).await;
         match execution {
             Ok(result) => {
-                if parsed.action == "query_agent_status" {
-                    let answer = result.get("answer").and_then(|v| v.as_str()).or_else(|| {
-                        result
-                            .get("statusReply")
-                            .and_then(|v| v.get("answer"))
-                            .and_then(|v| v.as_str())
-                    });
-                    if let Some(answer) = answer {
-                        if let Err(err) = tts::speak(answer) {
+                if should_emit_status_reply(&parsed.action, &result) {
+                    if let Some(summary) = build_spoken_status_summary(&parsed.action, &result) {
+                        if let Err(err) = tts::speak(&summary) {
                             self.emit_error(app, format!("tts failed: {}", err))?;
                         }
                         app.emit(
                             "voice_status_reply",
                             VoiceStatusReplyEvent {
-                                text: answer.to_string(),
-                                query: text.clone(),
-                                resolved: result
-                                    .get("resolved")
-                                    .cloned()
-                                    .unwrap_or_else(|| serde_json::json!({})),
+                                request_type: status_request_type(&parsed.action, &result),
+                                target_agent_id: target_agent_id_from_result(&result),
+                                summary,
+                                at: now_timestamp(),
                             },
                         )?;
                     }
                 }
+                let execution_event = build_voice_action_executed_event(
+                    &parsed.action,
+                    &parsed.payload,
+                    &result,
+                    "ok",
+                );
                 app.emit(
-                    "voice_command_executed",
-                    VoiceCommandExecutedEvent {
-                        action: parsed.action,
-                        success: true,
-                        result: result.clone(),
-                    },
+                    "voice_action_executed",
+                    execution_event,
                 )?;
                 self.set_state(app, VoiceRuntimeState::Listening)?;
                 Ok(result)
             }
             Err(err) => {
+                let execution_event = build_voice_action_executed_event(
+                    &parsed.action,
+                    &parsed.payload,
+                    &serde_json::json!({ "error": err.to_string() }),
+                    "error",
+                );
                 app.emit(
-                    "voice_command_executed",
-                    VoiceCommandExecutedEvent {
-                        action: parsed.action,
-                        success: false,
-                        result: serde_json::json!({ "error": err.to_string() }),
-                    },
+                    "voice_action_executed",
+                    execution_event,
                 )?;
                 self.emit_error(app, err.to_string())?;
                 self.set_state(app, VoiceRuntimeState::Listening)?;
                 Err(err)
             }
         }
+    }
+
+    async fn capture_command_transcript(&self, config: &EchoConfig) -> Result<String> {
+        let command_wav = tauri::async_runtime::spawn_blocking({
+            let mic_device = config.mic_device.clone();
+            let sample_rate = config.audio_sample_rate;
+            let duration = config.audio_max_record_ms;
+            move || audio::capture_wav_chunk(&mic_device, sample_rate, duration)
+        })
+        .await
+        .map_err(|err| anyhow!("audio capture task failed: {}", err))??;
+
+        let (sample_rate, command_samples) = audio::decode_wav_pcm16_mono(&command_wav)?;
+        let trimmed = audio::trim_with_vad(
+            &command_samples,
+            sample_rate,
+            COMMAND_VAD_THRESHOLD,
+            COMMAND_SILENCE_STOP_MS,
+            COMMAND_MIN_VOICED_MS,
+        );
+
+        if trimmed.is_empty() {
+            return Err(anyhow!("no speech detected for push-to-talk"));
+        }
+
+        let trimmed_wav = audio::encode_wav_pcm16_mono(sample_rate, &trimmed);
+        let transcript = asr::transcribe_wav(config, trimmed_wav).await?;
+        let text = transcript.trim().to_string();
+        if text.is_empty() {
+            return Err(anyhow!("empty transcript from push-to-talk"));
+        }
+
+        Ok(text)
     }
 
     fn set_state(&self, app: &AppHandle, state: VoiceRuntimeState) -> Result<()> {
@@ -447,5 +506,177 @@ impl VoiceManager {
     fn emit_error(&self, app: &AppHandle, message: String) -> Result<()> {
         app.emit("voice_error", VoiceErrorEvent { message })?;
         Ok(())
+    }
+}
+
+fn build_voice_action_executed_event(
+    action: &str,
+    payload: &Value,
+    result: &Value,
+    outcome: &str,
+) -> VoiceCommandExecutedEvent {
+    VoiceCommandExecutedEvent {
+        action: action.to_string(),
+        target_agent_id: target_agent_id_from_result(result)
+            .or_else(|| payload.get("agent_id").and_then(|value| value.as_i64())),
+        target_session_id: target_session_id_from_result(result)
+            .or_else(|| payload.get("session_id").and_then(|value| value.as_i64())),
+        text: payload
+            .get("input")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        result: outcome.to_string(),
+        at: now_timestamp(),
+    }
+}
+
+fn target_agent_id_from_result(result: &Value) -> Option<i64> {
+    result
+        .get("targetAgentId")
+        .and_then(|value| value.as_i64())
+        .or_else(|| result.get("agentId").and_then(|value| value.as_i64()))
+        .or_else(|| {
+            result
+                .get("agent")
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_i64())
+        })
+}
+
+fn target_session_id_from_result(result: &Value) -> Option<i64> {
+    result
+        .get("targetSessionId")
+        .and_then(|value| value.as_i64())
+        .or_else(|| result.get("sessionId").and_then(|value| value.as_i64()))
+        .or_else(|| {
+            result
+                .get("session")
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_i64())
+        })
+}
+
+fn now_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn should_emit_status_reply(action: &str, result: &Value) -> bool {
+    matches!(
+        result.get("type").and_then(|value| value.as_str()),
+        Some("status_reply" | "status_overview" | "input_needed_list")
+    ) || matches!(
+        action,
+        "status_agent" | "status_overview" | "list_input_needed" | "query_agent_status"
+    )
+}
+
+fn status_request_type(action: &str, result: &Value) -> String {
+    if let Some(result_type) = result.get("type").and_then(|value| value.as_str()) {
+        return result_type.to_string();
+    }
+    action.to_string()
+}
+
+fn build_spoken_status_summary(_action: &str, result: &Value) -> Option<String> {
+    let result_type = result.get("type").and_then(|value| value.as_str());
+    match result_type {
+        Some("input_needed_list") => {
+            let alerts = result
+                .get("alerts")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let unresolved = alerts.len();
+            if unresolved == 0 {
+                return Some("No agents need input right now.".to_string());
+            }
+
+            let mut sample_reasons = Vec::new();
+            for alert in alerts.iter().take(2) {
+                if let Some(reason) = alert.get("reason").and_then(|value| value.as_str()) {
+                    let reason_text = reason.replace('_', " ");
+                    if !reason_text.trim().is_empty() {
+                        sample_reasons.push(reason_text);
+                    }
+                }
+            }
+
+            let reason_clause = if sample_reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" Top reasons: {}.", sample_reasons.join(", "))
+            };
+            Some(format!(
+                "{} unresolved input requests need attention.{}",
+                unresolved, reason_clause
+            ))
+        }
+        _ => result
+            .get("answer")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_action_event_uses_result_targets() {
+        let payload = serde_json::json!({ "agent_id": 1, "session_id": 2, "input": "run tests" });
+        let result = serde_json::json!({ "agentId": 12, "sessionId": 77 });
+        let event = build_voice_action_executed_event("send_input", &payload, &result, "ok");
+        assert_eq!(event.action, "send_input");
+        assert_eq!(event.target_agent_id, Some(12));
+        assert_eq!(event.target_session_id, Some(77));
+        assert_eq!(event.text.as_deref(), Some("run tests"));
+        assert_eq!(event.result, "ok");
+    }
+
+    #[test]
+    fn voice_action_event_falls_back_to_payload_targets() {
+        let payload = serde_json::json!({ "agent_id": 5, "session_id": 6 });
+        let result = serde_json::json!({});
+        let event = build_voice_action_executed_event("attach_agent", &payload, &result, "ok");
+        assert_eq!(event.target_agent_id, Some(5));
+        assert_eq!(event.target_session_id, Some(6));
+    }
+
+    #[test]
+    fn spoken_summary_prioritizes_alert_rollup() {
+        let result = serde_json::json!({
+            "type": "input_needed_list",
+            "alerts": [
+                { "reason": "approval_needed" },
+                { "reason": "auth_needed" },
+                { "reason": "tool_confirmation" }
+            ]
+        });
+        let summary = build_spoken_status_summary("list_input_needed", &result)
+            .expect("summary must exist");
+        assert!(summary.contains("3 unresolved input requests need attention."));
+        assert!(summary.contains("approval needed"));
+        assert!(summary.contains("auth needed"));
+    }
+
+    #[test]
+    fn spoken_summary_uses_answer_for_direct_status_reply() {
+        let result = serde_json::json!({
+            "type": "status_reply",
+            "answer": "Agent Alpha is active."
+        });
+        let summary =
+            build_spoken_status_summary("status_agent", &result).expect("summary must exist");
+        assert_eq!(summary, "Agent Alpha is active.");
+    }
+
+    #[test]
+    fn status_reply_detection_uses_result_type() {
+        let result = serde_json::json!({ "type": "status_overview" });
+        assert!(should_emit_status_reply("attach_agent", &result));
     }
 }

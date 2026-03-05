@@ -120,16 +120,16 @@ This roadmap assumes a v1 target of up to 10 concurrent active sessions and prio
 
 ### Phase 3 - Multi-Agent Vertical UI
 
-- [ ] Replace current list/table with a vertically scrollable agent card rail.
-- [ ] Each card shows: agent identity, provider, task, session status, last activity, input-needed badge.
-- [ ] Add clear "Needs input" affordances and quick actions (`Attach`, `Reply`, `Acknowledge`).
-- [ ] Keep detail pane for focused agent and session timeline.
-- [ ] Add keyboard navigation and focus sync with voice targeting (`agent 1`, `agent alpha`).
+- [x] Replace current list/table with a vertically scrollable agent card rail.
+- [x] Each card shows: agent identity, provider, task, session status, last activity, input-needed badge.
+- [x] Add clear "Needs input" affordances and quick actions (`Attach`, `Reply`, `Acknowledge`).
+- [x] Keep detail pane for focused agent and session timeline.
+- [x] Add keyboard navigation and focus sync with voice targeting (`agent 1`, `agent alpha`).
 
 ### Phase 4 - Voice Command Surface (Hybrid Wake + Push-to-Talk)
 
-- [ ] Add push-to-talk command path in addition to wake detection.
-- [ ] Upgrade intent schema for deterministic actions:
+- [x] Add push-to-talk command path in addition to wake detection.
+- [x] Upgrade intent schema for deterministic actions:
   - `status_overview`
   - `status_agent`
   - `start_session`
@@ -137,9 +137,9 @@ This roadmap assumes a v1 target of up to 10 concurrent active sessions and prio
   - `attach_agent`
   - `send_input`
   - `list_input_needed`
-- [ ] Implement deterministic resolver for name + index aliases before LLM fallback.
-- [ ] Add spoken status summaries for alerts and direct query responses.
-- [ ] Add guardrails for destructive/ambiguous commands (require confirmation intent).
+- [x] Implement deterministic resolver for name + index aliases before LLM fallback.
+- [x] Add spoken status summaries for alerts and direct query responses.
+- [x] Add guardrails for destructive/ambiguous commands (require confirmation intent).
 
 ### Phase 5 - Full Terminal Attach Experience
 

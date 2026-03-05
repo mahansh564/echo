@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 use crate::db::{models::ManagedSession, models::StartSessionRequest, Db};
@@ -41,20 +41,12 @@ pub struct TerminalSession {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct TerminalSnippetEvent {
-    agent_id: Option<i64>,
+struct TerminalChunkEvent {
     session_id: i64,
-    snippet: String,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct ManagedSessionUpdatedEvent {
-    session_id: i64,
-    status: String,
-    last_heartbeat_at: Option<String>,
-    agent_id: Option<i64>,
-    task_id: Option<i64>,
+    cursor: usize,
+    chunk: String,
+    is_delta: bool,
+    at: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -92,6 +84,7 @@ struct SessionAlertCreatedEvent {
 struct SessionHandle {
     last_snippet: Arc<Mutex<String>>,
     output: Arc<Mutex<String>>,
+    master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     stopped: Arc<AtomicBool>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
@@ -133,8 +126,22 @@ impl TerminalManager {
         self.supervisor.session_output(session_id)
     }
 
+    pub fn session_output_chunk(
+        &self,
+        session_id: i64,
+        cursor: usize,
+        max_bytes: usize,
+    ) -> Option<(String, usize, bool)> {
+        self.supervisor
+            .session_output_chunk(session_id, cursor, max_bytes)
+    }
+
     pub fn send_input(&self, session_id: i64, input: &str) -> Result<()> {
         self.supervisor.send_input(session_id, input)
+    }
+
+    pub fn resize_session(&self, session_id: i64, cols: u16, rows: u16) -> Result<()> {
+        self.supervisor.resize_session(session_id, cols, rows)
     }
 
     pub async fn reconcile_orphan_sessions(&self, db: &Db) -> Result<usize> {
@@ -188,7 +195,9 @@ impl TerminalManager {
         let mut cmd = CommandBuilder::new(command);
         cmd.args(args);
         let child = pair.slave.spawn_command(cmd)?;
-        let mut reader = pair.master.try_clone_reader()?;
+        let master = pair.master;
+        let mut reader = master.try_clone_reader()?;
+        let writer = master.take_writer()?;
 
         let id = self.next_legacy_id.fetch_add(1, Ordering::SeqCst);
         let last_snippet = Arc::new(Mutex::new(String::new()));
@@ -213,7 +222,8 @@ impl TerminalManager {
         let handle = SessionHandle {
             last_snippet,
             output: Arc::new(Mutex::new(String::new())),
-            writer: Mutex::new(pair.master.take_writer()?),
+            master: Mutex::new(master),
+            writer: Mutex::new(writer),
             stopped: Arc::new(AtomicBool::new(false)),
             child: Mutex::new(child),
         };
@@ -386,8 +396,9 @@ impl SessionSupervisor {
             emit_runtime_events(app, &db, managed.id).await;
         });
 
-        let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        let master = pair.master;
+        let mut reader = master.try_clone_reader()?;
+        let writer = master.take_writer()?;
         let last_snippet = Arc::new(Mutex::new(String::new()));
         let output = Arc::new(Mutex::new(String::new()));
         let last_heartbeat = Arc::new(Mutex::new(Instant::now()));
@@ -397,6 +408,7 @@ impl SessionSupervisor {
         let handle = SessionHandle {
             last_snippet: Arc::clone(&last_snippet),
             output: Arc::clone(&output),
+            master: Mutex::new(master),
             writer: Mutex::new(writer),
             stopped: Arc::clone(&stopped),
             child: Mutex::new(child),
@@ -586,12 +598,18 @@ impl SessionSupervisor {
                             }
 
                             if last_emit.elapsed() >= Duration::from_millis(250) {
-                                let payload = TerminalSnippetEvent {
-                                    agent_id,
-                                    session_id,
-                                    snippet: snippet.clone(),
+                                let cursor = {
+                                    let out = output_for_reader.lock().unwrap();
+                                    out.len()
                                 };
-                                let _ = app_handle.emit("terminal_snippet_updated", payload);
+                                let payload = TerminalChunkEvent {
+                                    session_id,
+                                    cursor,
+                                    chunk: snippet.clone(),
+                                    is_delta: true,
+                                    at: now_timestamp(),
+                                };
+                                let _ = app_handle.emit("terminal_chunk", payload);
                                 let db_write = db_for_reader.clone();
                                 tauri::async_runtime::spawn(async move {
                                     if let Some(agent_id) = agent_id {
@@ -601,10 +619,10 @@ impl SessionSupervisor {
                                     let _ = db_write
                                         .insert_session_event(
                                             session_id,
-                                            "snippet",
+                                            "chunk",
                                             None,
                                             Some(
-                                                &serde_json::json!({ "snippet": snippet })
+                                                &serde_json::json!({ "chunk": snippet })
                                                     .to_string(),
                                             ),
                                         )
@@ -710,6 +728,29 @@ impl SessionSupervisor {
         Some(text)
     }
 
+    pub fn session_output_chunk(
+        &self,
+        session_id: i64,
+        cursor: usize,
+        max_bytes: usize,
+    ) -> Option<(String, usize, bool)> {
+        let sessions = self.sessions.lock().unwrap();
+        let output = Arc::clone(&sessions.get(&session_id)?.output);
+        drop(sessions);
+        let text = output.lock().unwrap().clone();
+
+        let clamped_cursor = clamp_to_char_boundary(&text, cursor.min(text.len()));
+        if clamped_cursor >= text.len() {
+            return Some((String::new(), text.len(), false));
+        }
+
+        let requested_end = clamped_cursor.saturating_add(max_bytes.max(1));
+        let end = clamp_to_char_boundary(&text, requested_end.min(text.len()));
+        let chunk = text[clamped_cursor..end].to_string();
+        let has_more = end < text.len();
+        Some((chunk, end, has_more))
+    }
+
     pub fn send_input(&self, session_id: i64, input: &str) -> Result<()> {
         let sessions = self.sessions.lock().unwrap();
         let handle = sessions
@@ -723,21 +764,39 @@ impl SessionSupervisor {
         writer.flush()?;
         Ok(())
     }
+
+    pub fn resize_session(&self, session_id: i64, cols: u16, rows: u16) -> Result<()> {
+        let sessions = self.sessions.lock().unwrap();
+        let handle = sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("session not found"))?;
+        let master = handle
+            .master
+            .lock()
+            .map_err(|_| anyhow!("master lock poisoned"))?;
+        master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        Ok(())
+    }
+}
+
+fn clamp_to_char_boundary(text: &str, idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    let mut i = idx;
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 async fn emit_runtime_events(app: &AppHandle, db: &Db, session_id: i64) {
     if let Ok(session) = db.get_managed_session(session_id).await {
-        let _ = app.emit(
-            "managed_session_updated",
-            ManagedSessionUpdatedEvent {
-                session_id,
-                status: session.status.clone(),
-                last_heartbeat_at: session.last_heartbeat_at.clone(),
-                agent_id: session.agent_id,
-                task_id: session.task_id,
-            },
-        );
-
         if let Some(agent_id) = session.agent_id {
             let unresolved_count = db
                 .list_unresolved_session_alerts(Some(agent_id), Some(100))
@@ -767,6 +826,13 @@ async fn emit_runtime_events(app: &AppHandle, db: &Db, session_id: i64) {
             }
         }
     }
+}
+
+fn now_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 #[cfg(test)]

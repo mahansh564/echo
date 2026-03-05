@@ -52,3 +52,34 @@ pub async fn process_voice_text_cmd(
         .await
         .map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn push_to_talk_cmd(
+    app: tauri::AppHandle,
+    voice: tauri::State<'_, VoiceManager>,
+    db: tauri::State<'_, Db>,
+    terminal: tauri::State<'_, TerminalManager>,
+    config: tauri::State<'_, EchoConfig>,
+) -> Result<serde_json::Value, String> {
+    let should_restart = voice.status().running;
+
+    if should_restart {
+        voice.stop(&app).map_err(|e| e.to_string())?;
+    }
+
+    let result = voice
+        .process_push_to_talk(&app, db.inner(), terminal.inner(), config.inner())
+        .await
+        .map_err(|e| e.to_string());
+
+    if should_restart {
+        let _ = voice.start(
+            &app,
+            config.inner(),
+            db.inner().clone(),
+            terminal.inner().clone(),
+        );
+    }
+
+    result
+}
