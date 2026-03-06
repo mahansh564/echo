@@ -1,6 +1,6 @@
 pub mod models;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use models::{AgentRow, ManagedSession, SessionAlert, SessionEvent, Task};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -430,6 +430,82 @@ impl Db {
         Ok(())
     }
 
+    pub async fn attach_terminal_session(&self, session_id: i64) -> Result<ManagedSession> {
+        let mut conn = self.pool.acquire().await?;
+        let current = sqlx::query_as::<_, ManagedSession>(&format!(
+            "SELECT {} FROM managed_sessions WHERE id = ?",
+            MANAGED_SESSION_SELECT_COLUMNS
+        ))
+        .bind(session_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        if matches!(current.status.as_str(), "ended" | "failed") {
+            return Err(anyhow!("cannot attach to session in {}", current.status));
+        }
+
+        sqlx::query(
+            "UPDATE managed_sessions
+             SET attach_count = attach_count + 1,
+                 last_activity_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(session_id)
+        .execute(&mut *conn)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO session_events (session_id, event_type, message, payload_json)
+             VALUES (?, 'attach', ?, ?)",
+        )
+        .bind(session_id)
+        .bind(Some("terminal attached"))
+        .bind(Some(serde_json::json!({ "transport": "pty" }).to_string()))
+        .execute(&mut *conn)
+        .await?;
+
+        let updated = sqlx::query_as::<_, ManagedSession>(&format!(
+            "SELECT {} FROM managed_sessions WHERE id = ?",
+            MANAGED_SESSION_SELECT_COLUMNS
+        ))
+        .bind(session_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(updated)
+    }
+
+    pub async fn detach_terminal_session(&self, session_id: i64) -> Result<ManagedSession> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "UPDATE managed_sessions
+             SET attach_count = CASE WHEN attach_count > 0 THEN attach_count - 1 ELSE 0 END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(session_id)
+        .execute(&mut *conn)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO session_events (session_id, event_type, message, payload_json)
+             VALUES (?, 'detach', ?, ?)",
+        )
+        .bind(session_id)
+        .bind(Some("terminal detached"))
+        .bind(Some(serde_json::json!({ "transport": "pty" }).to_string()))
+        .execute(&mut *conn)
+        .await?;
+
+        let updated = sqlx::query_as::<_, ManagedSession>(&format!(
+            "SELECT {} FROM managed_sessions WHERE id = ?",
+            MANAGED_SESSION_SELECT_COLUMNS
+        ))
+        .bind(session_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(updated)
+    }
+
     pub async fn set_session_pid(&self, session_id: i64, pid: Option<i64>) -> Result<()> {
         sqlx::query(
             "UPDATE managed_sessions SET pid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -453,6 +529,23 @@ impl Db {
             .bind(session_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    pub async fn delete_managed_session(&self, session_id: i64) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE agents SET active_session_id = NULL WHERE active_session_id = ?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        let result = sqlx::query("DELETE FROM managed_sessions WHERE id = ?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(anyhow!("session not found"));
+        }
+        tx.commit().await?;
         Ok(())
     }
 

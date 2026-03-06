@@ -60,6 +60,7 @@ pub async fn start_agent_session_cmd(
 
     terminal
         .start_session(&app, db.inner().clone(), request)
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -71,6 +72,22 @@ pub async fn stop_agent_session_cmd(
 ) -> Result<(), String> {
     terminal
         .stop_session(db.inner().clone(), session_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_managed_session_cmd(
+    terminal: tauri::State<'_, TerminalManager>,
+    db: tauri::State<'_, Db>,
+    session_id: i64,
+) -> Result<(), String> {
+    if terminal.has_session(session_id) {
+        terminal
+            .stop_session(db.inner().clone(), session_id)
+            .map_err(|e| e.to_string())?;
+    }
+    db.delete_managed_session(session_id)
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -160,6 +177,42 @@ pub async fn send_terminal_input_cmd(
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn send_terminal_data_cmd(
+    terminal: tauri::State<'_, TerminalManager>,
+    db: tauri::State<'_, Db>,
+    session_id: i64,
+    data: String,
+) -> Result<(), String> {
+    terminal
+        .send_input(session_id, &data)
+        .map_err(|e| e.to_string())?;
+    db.clear_session_needs_input(session_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn attach_terminal_session_cmd(
+    db: tauri::State<'_, Db>,
+    session_id: i64,
+) -> Result<ManagedSession, String> {
+    db.attach_terminal_session(session_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn detach_terminal_session_cmd(
+    db: tauri::State<'_, Db>,
+    session_id: i64,
+) -> Result<ManagedSession, String> {
+    db.detach_terminal_session(session_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 fn now_timestamp() -> String {

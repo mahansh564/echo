@@ -143,9 +143,9 @@ This roadmap assumes a v1 target of up to 10 concurrent active sessions and prio
 
 ### Phase 5 - Full Terminal Attach Experience
 
-- [ ] Replace plain `<pre>` terminal with PTY-capable terminal widget supporting ANSI, alternate screen, resize, and raw input.
-- [ ] Stream incremental output chunks with cursoring/backpressure instead of full-buffer polling.
-- [ ] Implement attach/detach semantics so an agent session can be interactively controlled in-app.
+- [x] Replace plain `<pre>` terminal with PTY-capable terminal widget supporting ANSI, alternate screen, resize, and raw input.
+- [x] Stream incremental output chunks with cursoring/backpressure instead of full-buffer polling.
+- [x] Implement attach/detach semantics so an agent session can be interactively controlled in-app.
 - [ ] Add popout terminal path for focused full-screen work while preserving shared session state.
 - [ ] Validate with TUI-heavy workflows (`vim`, `less`, REPLs, test runners).
 

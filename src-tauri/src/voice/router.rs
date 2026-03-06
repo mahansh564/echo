@@ -287,7 +287,8 @@ pub async fn execute_command(
                     task_id: agent.as_ref().and_then(|value| value.task_id),
                     provider: Some("opencode".to_string()),
                 },
-            )?;
+            )
+            .await?;
 
             Ok(serde_json::json!({
                 "type": "session_started",
@@ -496,7 +497,8 @@ pub async fn execute_command(
                     task_id: agent.as_ref().and_then(|value| value.task_id),
                     provider: Some("opencode".to_string()),
                 },
-            )?;
+            )
+            .await?;
             Ok(serde_json::json!({
                 "type": "session_started",
                 "session": session,

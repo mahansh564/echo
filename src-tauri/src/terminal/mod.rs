@@ -101,17 +101,21 @@ impl TerminalManager {
         }
     }
 
-    pub fn start_session(
+    pub async fn start_session(
         &self,
         app: &AppHandle,
         db: Db,
         request: StartSessionRequest,
     ) -> Result<ManagedSession> {
-        self.supervisor.start_session(app, db, request)
+        self.supervisor.start_session(app, db, request).await
     }
 
     pub fn stop_session(&self, db: Db, session_id: i64) -> Result<()> {
         self.supervisor.stop_session(db, session_id)
+    }
+
+    pub fn has_session(&self, session_id: i64) -> bool {
+        self.supervisor.has_session(session_id)
     }
 
     pub fn last_snippet(&self, session_id: i64) -> Option<String> {
@@ -149,7 +153,7 @@ impl TerminalManager {
     }
 
     // Deprecated compatibility shim.
-    pub fn start_session_legacy(
+    pub async fn start_session_legacy(
         &self,
         app: &AppHandle,
         db: Db,
@@ -166,7 +170,8 @@ impl TerminalManager {
                 task_id: None,
                 provider: Some("opencode".to_string()),
             },
-        )?;
+        )
+        .await?;
         Ok(TerminalSession {
             id: session.id as u64,
             agent_id,
@@ -281,7 +286,7 @@ impl SessionSupervisor {
         Ok(reconciled)
     }
 
-    pub fn start_session(
+    pub async fn start_session(
         &self,
         app: &AppHandle,
         db: Db,
@@ -298,15 +303,17 @@ impl SessionSupervisor {
         }
 
         let args_json = serde_json::to_string(&spawn_spec.args)?;
-        let managed = tauri::async_runtime::block_on(db.create_managed_session(
-            adapter.provider_name(),
-            &spawn_spec.command,
-            &args_json,
-            spawn_spec.cwd.as_deref(),
-            request.agent_id,
-            request.task_id,
-            None,
-        ))?;
+        let managed = db
+            .create_managed_session(
+                adapter.provider_name(),
+                &spawn_spec.command,
+                &args_json,
+                spawn_spec.cwd.as_deref(),
+                request.agent_id,
+                request.task_id,
+                None,
+            )
+            .await?;
 
         let pty_system = native_pty_system();
         let pair = match pty_system.openpty(PtySize {
@@ -317,20 +324,18 @@ impl SessionSupervisor {
         }) {
             Ok(pair) => pair,
             Err(err) => {
-                tauri::async_runtime::block_on(async {
-                    let _ = db
-                        .update_session_status(managed.id, "failed", Some(&err.to_string()))
-                        .await;
-                    let _ = db
-                        .insert_session_event(
-                            managed.id,
-                            "error",
-                            Some("failed to open PTY"),
-                            Some(&serde_json::json!({ "error": err.to_string() }).to_string()),
-                        )
-                        .await;
-                    emit_runtime_events(app, &db, managed.id).await;
-                });
+                let _ = db
+                    .update_session_status(managed.id, "failed", Some(&err.to_string()))
+                    .await;
+                let _ = db
+                    .insert_session_event(
+                        managed.id,
+                        "error",
+                        Some("failed to open PTY"),
+                        Some(&serde_json::json!({ "error": err.to_string() }).to_string()),
+                    )
+                    .await;
+                emit_runtime_events(app, &db, managed.id).await;
                 return Err(err.into());
             }
         };
@@ -352,49 +357,45 @@ impl SessionSupervisor {
         let child = match pair.slave.spawn_command(cmd) {
             Ok(child) => child,
             Err(err) => {
-                tauri::async_runtime::block_on(async {
-                    let _ = db
-                        .update_session_status(managed.id, "failed", Some(&err.to_string()))
-                        .await;
-                    let _ = db
-                        .insert_session_event(
-                            managed.id,
-                            "error",
-                            Some("failed to spawn command"),
-                            Some(&serde_json::json!({ "error": err.to_string() }).to_string()),
-                        )
-                        .await;
-                    emit_runtime_events(app, &db, managed.id).await;
-                });
+                let _ = db
+                    .update_session_status(managed.id, "failed", Some(&err.to_string()))
+                    .await;
+                let _ = db
+                    .insert_session_event(
+                        managed.id,
+                        "error",
+                        Some("failed to spawn command"),
+                        Some(&serde_json::json!({ "error": err.to_string() }).to_string()),
+                    )
+                    .await;
+                emit_runtime_events(app, &db, managed.id).await;
                 return Err(err.into());
             }
         };
 
         let pid = child.process_id().map(|p| p as i64);
-        tauri::async_runtime::block_on(async {
-            let _ = db.set_session_pid(managed.id, pid).await;
-            let _ = db.update_session_status(managed.id, "active", None).await;
-            let _ = db.update_session_heartbeat(managed.id).await;
-            let _ = db
-                .insert_session_event(
-                    managed.id,
-                    "spawned",
-                    Some("session started"),
-                    Some(
-                        &serde_json::json!({
-                            "command": spawn_spec.command,
-                            "args": spawn_spec.args,
-                            "cwd": spawn_spec.cwd,
-                            "pid": pid,
-                            "provider": adapter.provider_name(),
-                            "supports_attach": adapter.supports_terminal_attach(),
-                        })
-                        .to_string(),
-                    ),
-                )
-                .await;
-            emit_runtime_events(app, &db, managed.id).await;
-        });
+        let _ = db.set_session_pid(managed.id, pid).await;
+        let _ = db.update_session_status(managed.id, "active", None).await;
+        let _ = db.update_session_heartbeat(managed.id).await;
+        let _ = db
+            .insert_session_event(
+                managed.id,
+                "spawned",
+                Some("session started"),
+                Some(
+                    &serde_json::json!({
+                        "command": spawn_spec.command,
+                        "args": spawn_spec.args,
+                        "cwd": spawn_spec.cwd,
+                        "pid": pid,
+                        "provider": adapter.provider_name(),
+                        "supports_attach": adapter.supports_terminal_attach(),
+                    })
+                    .to_string(),
+                ),
+            )
+            .await;
+        emit_runtime_events(app, &db, managed.id).await;
 
         let master = pair.master;
         let mut reader = master.try_clone_reader()?;
@@ -683,7 +684,7 @@ impl SessionSupervisor {
             }
         });
 
-        let latest = tauri::async_runtime::block_on(db.get_managed_session(managed.id))?;
+        let latest = db.get_managed_session(managed.id).await?;
         Ok(latest)
     }
 
@@ -718,6 +719,11 @@ impl SessionSupervisor {
     pub fn list_runtime_sessions(&self) -> Vec<i64> {
         let sessions = self.sessions.lock().unwrap();
         sessions.keys().copied().collect()
+    }
+
+    pub fn has_session(&self, session_id: i64) -> bool {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.contains_key(&session_id)
     }
 
     pub fn session_output(&self, session_id: i64) -> Option<String> {

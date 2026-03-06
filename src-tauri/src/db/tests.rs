@@ -78,6 +78,81 @@ async fn managed_session_lifecycle_persists() {
 }
 
 #[tokio::test]
+async fn delete_managed_session_clears_agent_link_and_cascades_rows() {
+    let db = setup_test_db().await;
+    let agent = db
+        .create_agent("Agent Delete", Some("opencode"), None, None)
+        .await
+        .unwrap();
+    let session = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.insert_session_event(session.id, "spawned", Some("ok"), None)
+        .await
+        .unwrap();
+    db.create_session_alert(
+        session.id,
+        Some(agent.id),
+        "warning",
+        "input_prompt",
+        "requires input",
+        true,
+    )
+    .await
+    .unwrap();
+
+    db.delete_managed_session(session.id).await.unwrap();
+
+    assert!(db.get_managed_session(session.id).await.is_err());
+    let events = db.list_session_events(session.id, Some(10)).await.unwrap();
+    assert!(events.is_empty());
+    let alerts = db
+        .list_session_alerts(Some(agent.id), false, Some(10))
+        .await
+        .unwrap();
+    assert!(alerts.is_empty());
+    let agents = db.list_agents().await.unwrap();
+    let stored_agent = agents.iter().find(|row| row.id == agent.id).unwrap();
+    assert_eq!(stored_agent.active_session_id, None);
+}
+
+#[tokio::test]
+async fn terminal_attach_detach_updates_attach_count() {
+    let db = setup_test_db().await;
+    let session = db
+        .create_managed_session("opencode", "opencode", "[]", None, None, None, None)
+        .await
+        .unwrap();
+    db.update_session_status(session.id, "active", None)
+        .await
+        .unwrap();
+
+    let attached = db.attach_terminal_session(session.id).await.unwrap();
+    assert_eq!(attached.attach_count, 1);
+
+    let attached_again = db.attach_terminal_session(session.id).await.unwrap();
+    assert_eq!(attached_again.attach_count, 2);
+
+    let detached = db.detach_terminal_session(session.id).await.unwrap();
+    assert_eq!(detached.attach_count, 1);
+
+    let detached_again = db.detach_terminal_session(session.id).await.unwrap();
+    assert_eq!(detached_again.attach_count, 0);
+
+    let detached_floor = db.detach_terminal_session(session.id).await.unwrap();
+    assert_eq!(detached_floor.attach_count, 0);
+}
+
+#[tokio::test]
 async fn list_agent_rows_includes_runtime_session_summary() {
     let db = setup_test_db().await;
     let task = db
