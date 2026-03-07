@@ -19,6 +19,23 @@ const STALE_THRESHOLD: Duration = Duration::from_secs(20);
 const MONITOR_INTERVAL: Duration = Duration::from_secs(5);
 const PARSE_ERROR_ALERT_THROTTLE: Duration = Duration::from_secs(30);
 
+fn apply_terminal_env(cmd: &mut CommandBuilder) {
+    // Full-screen TUIs break badly with TERM=dumb (partial renders, no alt-screen semantics).
+    let term = std::env::var("TERM").unwrap_or_default();
+    if term.trim().is_empty() || term == "dumb" {
+        cmd.env("TERM", "xterm-256color");
+    } else {
+        cmd.env("TERM", term);
+    }
+
+    let colorterm = std::env::var("COLORTERM").unwrap_or_default();
+    if colorterm.trim().is_empty() {
+        cmd.env("COLORTERM", "truecolor");
+    } else {
+        cmd.env("COLORTERM", colorterm);
+    }
+}
+
 #[derive(Clone)]
 pub struct TerminalManager {
     supervisor: Arc<SessionSupervisor>,
@@ -199,6 +216,7 @@ impl TerminalManager {
 
         let mut cmd = CommandBuilder::new(command);
         cmd.args(args);
+        apply_terminal_env(&mut cmd);
         let child = pair.slave.spawn_command(cmd)?;
         let master = pair.master;
         let mut reader = master.try_clone_reader()?;
@@ -214,10 +232,9 @@ impl TerminalManager {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if let Ok(text) = std::str::from_utf8(&buf[..n]) {
-                            let mut stored = snippet_clone.lock().unwrap();
-                            *stored = text.to_string();
-                        }
+                        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let mut stored = snippet_clone.lock().unwrap();
+                        *stored = text;
                     }
                     Err(_) => break,
                 }
@@ -353,6 +370,7 @@ impl SessionSupervisor {
         if let Some(cwd) = spawn_spec.cwd.as_deref() {
             cmd.cwd(cwd);
         }
+        apply_terminal_env(&mut cmd);
 
         let child = match pair.slave.spawn_command(cmd) {
             Ok(child) => child,
@@ -438,57 +456,134 @@ impl SessionSupervisor {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if let Ok(text) = std::str::from_utf8(&buf[..n]) {
-                            let snippet = text.to_string();
-                            {
-                                let mut stored = last_snippet.lock().unwrap();
-                                *stored = snippet.clone();
+                        let snippet = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        {
+                            let mut stored = last_snippet.lock().unwrap();
+                            *stored = snippet.clone();
+                        }
+                        let cursor = {
+                            let mut out = output_for_reader.lock().unwrap();
+                            out.push_str(&snippet);
+                            if out.len() > 500_000 {
+                                let trim_at = out.len() - 500_000;
+                                out.drain(..trim_at);
                             }
-                            {
-                                let mut out = output_for_reader.lock().unwrap();
-                                out.push_str(&snippet);
-                                if out.len() > 500_000 {
-                                    let trim_at = out.len() - 500_000;
-                                    out.drain(..trim_at);
-                                }
-                            }
-                            {
-                                let mut hb = hb_for_reader.lock().unwrap();
-                                *hb = Instant::now();
-                            }
+                            out.len()
+                        };
+                        {
+                            let mut hb = hb_for_reader.lock().unwrap();
+                            *hb = Instant::now();
+                        }
 
-                            if stalled_for_reader.swap(false, Ordering::SeqCst) {
+                        let _ = app_handle.emit(
+                            "terminal_chunk",
+                            TerminalChunkEvent {
+                                session_id,
+                                cursor,
+                                chunk: snippet.clone(),
+                                is_delta: true,
+                                at: now_timestamp(),
+                            },
+                        );
+
+                        if stalled_for_reader.swap(false, Ordering::SeqCst) {
+                            let db_write = db_for_reader.clone();
+                            let app_write = app_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let _ = db_write
+                                    .update_session_status(session_id, "active", None)
+                                    .await;
+                                let _ = db_write
+                                    .insert_session_event(
+                                        session_id,
+                                        "heartbeat",
+                                        Some("session recovered"),
+                                        None,
+                                    )
+                                    .await;
+                                emit_runtime_events(&app_write, &db_write, session_id).await;
+                            });
+                        }
+
+                        match adapter.parse_structured_event(&snippet) {
+                            Ok(Some(ProviderStructuredEvent::InputRequired {
+                                severity,
+                                reason,
+                                message,
+                                requires_ack,
+                            })) => {
                                 let db_write = db_for_reader.clone();
                                 let app_write = app_handle.clone();
                                 tauri::async_runtime::spawn(async move {
                                     let _ = db_write
-                                        .update_session_status(session_id, "active", None)
+                                        .mark_session_needs_input(session_id, &reason, &message)
                                         .await;
-                                    let _ = db_write
-                                        .insert_session_event(
+                                    if let Ok(alert) = db_write
+                                        .create_session_alert(
                                             session_id,
-                                            "heartbeat",
-                                            Some("session recovered"),
-                                            None,
+                                            agent_id,
+                                            &severity,
+                                            &reason,
+                                            &message,
+                                            requires_ack,
                                         )
+                                        .await
+                                    {
+                                        let _ = app_write.emit(
+                                            "session_alert_created",
+                                            SessionAlertCreatedEvent {
+                                                alert_id: alert.id,
+                                                session_id,
+                                                agent_id,
+                                                severity,
+                                                reason,
+                                                message,
+                                                requires_ack,
+                                                created_at: alert.created_at,
+                                            },
+                                        );
+                                    }
+                                    emit_runtime_events(&app_write, &db_write, session_id).await;
+                                });
+                            }
+                            Ok(Some(ProviderStructuredEvent::SessionStatus { status, reason })) => {
+                                let db_write = db_for_reader.clone();
+                                let app_write = app_handle.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    let _ = db_write
+                                        .update_session_status(session_id, &status, reason.as_deref())
                                         .await;
                                     emit_runtime_events(&app_write, &db_write, session_id).await;
                                 });
                             }
-
-                            match adapter.parse_structured_event(&snippet) {
-                                Ok(Some(ProviderStructuredEvent::InputRequired {
-                                    severity,
-                                    reason,
-                                    message,
-                                    requires_ack,
-                                })) => {
-                                    let db_write = db_for_reader.clone();
-                                    let app_write = app_handle.clone();
-                                    tauri::async_runtime::spawn(async move {
-                                        let _ = db_write
-                                            .mark_session_needs_input(session_id, &reason, &message)
-                                            .await;
+                            Ok(None) => {}
+                            Err(err) => {
+                                let db_write = db_for_reader.clone();
+                                let app_write = app_handle.clone();
+                                let should_emit_alert = last_parse_error_alert_at
+                                    .map(|last| last.elapsed() >= PARSE_ERROR_ALERT_THROTTLE)
+                                    .unwrap_or(true);
+                                if should_emit_alert {
+                                    last_parse_error_alert_at = Some(Instant::now());
+                                }
+                                tauri::async_runtime::spawn(async move {
+                                    let _ = db_write
+                                        .insert_session_event(
+                                            session_id,
+                                            "provider_parse_error",
+                                            Some("adapter parse error"),
+                                            Some(
+                                                &serde_json::json!({ "error": err.to_string() })
+                                                    .to_string(),
+                                            ),
+                                        )
+                                        .await;
+                                    if should_emit_alert {
+                                        let severity = "warning".to_string();
+                                        let reason = "unknown".to_string();
+                                        let message =
+                                            "Provider parse error; using fallback stream mode"
+                                                .to_string();
                                         if let Ok(alert) = db_write
                                             .create_session_alert(
                                                 session_id,
@@ -496,7 +591,7 @@ impl SessionSupervisor {
                                                 &severity,
                                                 &reason,
                                                 &message,
-                                                requires_ack,
+                                                false,
                                             )
                                             .await
                                         {
@@ -509,128 +604,35 @@ impl SessionSupervisor {
                                                     severity,
                                                     reason,
                                                     message,
-                                                    requires_ack,
+                                                    requires_ack: false,
                                                     created_at: alert.created_at,
                                                 },
                                             );
                                         }
-                                        emit_runtime_events(&app_write, &db_write, session_id)
-                                            .await;
-                                    });
-                                }
-                                Ok(Some(ProviderStructuredEvent::SessionStatus {
-                                    status,
-                                    reason,
-                                })) => {
-                                    let db_write = db_for_reader.clone();
-                                    let app_write = app_handle.clone();
-                                    tauri::async_runtime::spawn(async move {
-                                        let _ = db_write
-                                            .update_session_status(
-                                                session_id,
-                                                &status,
-                                                reason.as_deref(),
-                                            )
-                                            .await;
-                                        emit_runtime_events(&app_write, &db_write, session_id)
-                                            .await;
-                                    });
-                                }
-                                Ok(None) => {}
-                                Err(err) => {
-                                    let db_write = db_for_reader.clone();
-                                    let app_write = app_handle.clone();
-                                    let should_emit_alert = last_parse_error_alert_at
-                                        .map(|last| last.elapsed() >= PARSE_ERROR_ALERT_THROTTLE)
-                                        .unwrap_or(true);
-                                    if should_emit_alert {
-                                        last_parse_error_alert_at = Some(Instant::now());
                                     }
-                                    tauri::async_runtime::spawn(async move {
-                                        let _ = db_write
-                                            .insert_session_event(
-                                                session_id,
-                                                "provider_parse_error",
-                                                Some("adapter parse error"),
-                                                Some(
-                                                    &serde_json::json!({ "error": err.to_string() })
-                                                        .to_string(),
-                                                ),
-                                            )
-                                            .await;
-                                        if should_emit_alert {
-                                            let severity = "warning".to_string();
-                                            let reason = "unknown".to_string();
-                                            let message =
-                                                "Provider parse error; using fallback stream mode"
-                                                    .to_string();
-                                            if let Ok(alert) = db_write
-                                                .create_session_alert(
-                                                    session_id, agent_id, &severity, &reason,
-                                                    &message, false,
-                                                )
-                                                .await
-                                            {
-                                                let _ = app_write.emit(
-                                                    "session_alert_created",
-                                                    SessionAlertCreatedEvent {
-                                                        alert_id: alert.id,
-                                                        session_id,
-                                                        agent_id,
-                                                        severity,
-                                                        reason,
-                                                        message,
-                                                        requires_ack: false,
-                                                        created_at: alert.created_at,
-                                                    },
-                                                );
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-
-                            if last_heartbeat_write.elapsed() >= HEARTBEAT_INTERVAL {
-                                let db_write = db_for_reader.clone();
-                                tauri::async_runtime::spawn(async move {
-                                    let _ = db_write.update_session_heartbeat(session_id).await;
                                 });
-                                last_heartbeat_write = Instant::now();
                             }
+                        }
 
-                            if last_emit.elapsed() >= Duration::from_millis(250) {
-                                let cursor = {
-                                    let out = output_for_reader.lock().unwrap();
-                                    out.len()
-                                };
-                                let payload = TerminalChunkEvent {
-                                    session_id,
-                                    cursor,
-                                    chunk: snippet.clone(),
-                                    is_delta: true,
-                                    at: now_timestamp(),
-                                };
-                                let _ = app_handle.emit("terminal_chunk", payload);
-                                let db_write = db_for_reader.clone();
-                                tauri::async_runtime::spawn(async move {
-                                    if let Some(agent_id) = agent_id {
-                                        let _ =
-                                            db_write.update_agent_snippet(agent_id, &snippet).await;
-                                    }
+                        if last_heartbeat_write.elapsed() >= HEARTBEAT_INTERVAL {
+                            let db_write = db_for_reader.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let _ = db_write.update_session_heartbeat(session_id).await;
+                            });
+                            last_heartbeat_write = Instant::now();
+                        }
+
+                        if last_emit.elapsed() >= Duration::from_millis(250) {
+                            let snippet_for_db = snippet.clone();
+                            let db_write = db_for_reader.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Some(agent_id) = agent_id {
                                     let _ = db_write
-                                        .insert_session_event(
-                                            session_id,
-                                            "chunk",
-                                            None,
-                                            Some(
-                                                &serde_json::json!({ "chunk": snippet })
-                                                    .to_string(),
-                                            ),
-                                        )
+                                        .update_agent_snippet(agent_id, &snippet_for_db)
                                         .await;
-                                });
-                                last_emit = Instant::now();
-                            }
+                                }
+                            });
+                            last_emit = Instant::now();
                         }
                     }
                     Err(_) => break,

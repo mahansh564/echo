@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { Terminal } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import "@xterm/xterm/css/xterm.css";
@@ -66,29 +66,6 @@
     failureReason?: string | null;
     createdAt: string;
     updatedAt: string;
-  };
-
-  type SessionAlert = {
-    id: number;
-    sessionId: number;
-    agentId?: number | null;
-    severity: "info" | "warning" | "critical" | string;
-    reason: string;
-    message: string;
-    requiresAck: boolean;
-    acknowledgedAt?: string | null;
-    resolvedAt?: string | null;
-    createdAt: string;
-    updatedAt: string;
-  };
-
-  type SessionEvent = {
-    id: number;
-    sessionId: number;
-    eventType: string;
-    message?: string | null;
-    payloadJson?: string | null;
-    createdAt: string;
   };
 
   type VoiceStatus = {
@@ -160,19 +137,13 @@
     cursor: number;
   };
 
-  type ActivityItem =
-    | {
-        key: string;
-        kind: "alert";
-        at: string;
-        alert: SessionAlert;
-      }
-    | {
-        key: string;
-        kind: "event";
-        at: string;
-        event: SessionEvent;
-      };
+  type AgentListItem = {
+    agent: AgentRow;
+    session: SessionRuntime | null;
+    status: SessionRuntime["status"] | "idle";
+    isRunning: boolean;
+    lastSeen: string;
+  };
 
   let agents = $state<AgentRow[]>([]);
   let sessions = $state<SessionRuntime[]>([]);
@@ -186,12 +157,11 @@
   let voiceInput = $state<string>("");
   let lastVoiceCommandText = $state<string>("");
   let pushToTalkBusy = $state<boolean>(false);
-  let sessionEvents = $state<SessionEvent[]>([]);
-  let unresolvedAlerts = $state<SessionAlert[]>([]);
   let selectedSessionId = $state<number | null>(null);
   let attachedSessionId = $state<number | null>(null);
   let terminalInput = $state<string>("");
   let terminalContainer: HTMLDivElement | null = $state(null);
+  let showClosedAgents = $state<boolean>(false);
 
   let terminalWidget: Terminal | null = null;
   let fitAddon: FitAddon | null = null;
@@ -218,7 +188,6 @@
     "stalled",
     "needs_input"
   ]);
-
   const isActiveSessionStatus = (status: SessionRuntime["status"]) =>
     ACTIVE_SESSION_STATUSES.has(status);
 
@@ -232,20 +201,49 @@
     sessions.filter((session) => isActiveSessionStatus(session.status))
   );
 
-  const activityItems = $derived<ActivityItem[]>([
-    ...unresolvedAlerts.map((alert) => ({
-      key: `alert-${alert.id}`,
-      kind: "alert" as const,
-      at: alert.createdAt,
-      alert
-    })),
-    ...sessionEvents.map((event) => ({
-      key: `event-${event.id}`,
-      kind: "event" as const,
-      at: formatRelativeTime(event.createdAt),
-      event
-    }))
-  ]);
+  const latestSessionByAgent = $derived(
+    (() => {
+      const map = new Map<number, SessionRuntime>();
+      for (const session of sessions) {
+        if (session.agentId === null || session.agentId === undefined) continue;
+        if (!map.has(session.agentId)) {
+          map.set(session.agentId, session);
+        }
+      }
+      return map;
+    })()
+  );
+
+  const agentListItems = $derived<AgentListItem[]>(
+    agents
+      .map((agent) => {
+        const activeSession = agent.activeSessionId
+          ? sessions.find((session) => session.id === agent.activeSessionId) ?? null
+          : null;
+        const session = activeSession ?? latestSessionByAgent.get(agent.id) ?? null;
+        const status: SessionRuntime["status"] | "idle" = session?.status ?? "idle";
+        const isRunning = status !== "ended" && status !== "failed" && status !== "idle";
+        const lastSeen = formatRelativeTime(
+          session?.lastActivityAt ?? session?.updatedAt ?? agent.lastActivityAt ?? agent.updatedAt
+        );
+
+        return {
+          agent,
+          session,
+          status,
+          isRunning,
+          lastSeen
+        };
+      })
+      .sort((a, b) => {
+        if (a.isRunning !== b.isRunning) return a.isRunning ? -1 : 1;
+        return a.agent.displayOrder - b.agent.displayOrder;
+      })
+  );
+
+  const visibleAgentListItems = $derived<AgentListItem[]>(
+    agentListItems.filter((item) => showClosedAgents || item.isRunning)
+  );
 
   const toTitleCase = (value: string) =>
     value
@@ -269,33 +267,21 @@
     return `${days}d ago`;
   };
 
-  const applyRelativeTimes = (list: AgentRow[], alertList: SessionAlert[]) => {
+  const applyRelativeTimes = (list: AgentRow[]) => {
     agents = list.map((agent) => ({
       ...agent,
       updatedAt: formatRelativeTime(agent.updatedAt),
       lastActivityAt: formatRelativeTime(agent.lastActivityAt ?? agent.updatedAt),
       lastInputRequiredAt: formatRelativeTime(agent.lastInputRequiredAt ?? null)
     }));
-    unresolvedAlerts = alertList.map((alert) => ({
-      ...alert,
-      createdAt: formatRelativeTime(alert.createdAt),
-      updatedAt: formatRelativeTime(alert.updatedAt),
-      acknowledgedAt: alert.acknowledgedAt ? formatRelativeTime(alert.acknowledgedAt) : null,
-      resolvedAt: alert.resolvedAt ? formatRelativeTime(alert.resolvedAt) : null
-    }));
   };
 
   async function loadData() {
     loading = true;
     try {
-      const [agentRowsResponse, sessionsResponse, alertsResponse] = await Promise.all([
+      const [agentRowsResponse, sessionsResponse] = await Promise.all([
         invoke("list_agent_rows_cmd", { limit: 200 }),
-        invoke("list_managed_sessions_cmd", { status: null, limit: 200 }),
-        invoke("list_session_alerts_cmd", {
-          agentId: null,
-          unresolvedOnly: true,
-          limit: 200
-        })
+        invoke("list_managed_sessions_cmd", { status: null, limit: 200 })
       ]);
 
       const mappedAgents = (agentRowsResponse as AgentRowPayload[]).map((row) => ({
@@ -317,7 +303,7 @@
         updatedAt: row.updatedAt
       }));
 
-      applyRelativeTimes(mappedAgents, alertsResponse as SessionAlert[]);
+      applyRelativeTimes(mappedAgents);
       sessions = sessionsResponse as SessionRuntime[];
 
       if (agents.length > 0 && !agents.some((agent) => agent.id === selectedAgentId)) {
@@ -374,18 +360,6 @@
     }
   }
 
-  async function openSessionLogs(sessionId: number) {
-    try {
-      const response = (await invoke("list_session_events_cmd", {
-        sessionId,
-        limit: 100
-      })) as SessionEvent[];
-      sessionEvents = response;
-    } catch (error) {
-      console.error("Failed to load session events", error);
-    }
-  }
-
   const lookupAgentName = (agentId?: number | null) =>
     agents.find((agent) => agent.id === agentId)?.name ?? "Unassigned";
 
@@ -428,7 +402,6 @@
       }
       selectedSessionId = null;
       clearTerminalView();
-      sessionEvents = [];
       return;
     }
 
@@ -441,6 +414,9 @@
     if (attachedSessionId !== sessionId) {
       await attachTerminalSession(sessionId);
     }
+
+    fitAddon?.fit();
+    await resizeTerminalSession(sessionId);
 
     if (reset || terminalCursorBySession.get(sessionId) === undefined) {
       await hydrateTerminalSession(sessionId, { reset: true });
@@ -474,24 +450,6 @@
       selectedAgentId = session.agentId;
     }
     await setSelectedSession(sessionId, { reset: true });
-  }
-
-  async function acknowledgeAlert(alertId: number) {
-    try {
-      await invoke("acknowledge_session_alert_cmd", { alertId });
-      await loadData();
-    } catch (error) {
-      console.error("Failed to acknowledge session alert", error);
-    }
-  }
-
-  async function resolveAlert(alertId: number) {
-    try {
-      await invoke("resolve_session_alert_cmd", { alertId });
-      await loadData();
-    } catch (error) {
-      console.error("Failed to resolve session alert", error);
-    }
   }
 
   function clearTerminalView() {
@@ -715,7 +673,7 @@
       fitAddon = new FitAddon();
       terminalWidget = new Terminal({
         cursorBlink: true,
-        convertEol: true,
+        convertEol: false,
         fontFamily: '"JetBrains Mono", "Menlo", monospace',
         fontSize: 12,
         lineHeight: 1.35,
@@ -738,6 +696,7 @@
         });
       });
 
+      await tick();
       fitAddon.fit();
       clearTerminalView();
       if (selectedSessionId) {
@@ -763,14 +722,6 @@
     }
   }
 
-  $effect(() => {
-    if (!selectedSessionId) {
-      sessionEvents = [];
-      return;
-    }
-    void openSessionLogs(selectedSessionId);
-  });
-
   onMount(() => {
     let unlistenTask: (() => void) | undefined;
     let unlistenAgent: (() => void) | undefined;
@@ -783,7 +734,6 @@
     let unlistenVoiceCommand: (() => void) | undefined;
     let unlistenVoiceError: (() => void) | undefined;
     let unlistenVoiceReply: (() => void) | undefined;
-    let unlistenAlertResolved: (() => void) | undefined;
 
     void initTerminalWidget();
 
@@ -851,9 +801,6 @@
           focusAgentById(payload.targetAgentId);
         }
       });
-      unlistenAlertResolved = await listen("session_alert_resolved", () => {
-        void loadData();
-      });
     };
 
     void startListeners();
@@ -914,7 +861,6 @@
       unlistenVoiceCommand?.();
       unlistenVoiceError?.();
       unlistenVoiceReply?.();
-      unlistenAlertResolved?.();
     };
   });
 </script>
@@ -987,43 +933,39 @@
 
     <aside class="activity-pane">
       <header class="pane-header">
-        <h2>Activity</h2>
-        <span>{activityItems.length}</span>
+        <h2>Agents</h2>
+        <div class="pane-header-actions">
+          <span>{visibleAgentListItems.length}</span>
+          <button class="ghost" onclick={() => (showClosedAgents = !showClosedAgents)}>
+            {showClosedAgents ? "Hide closed" : "Show closed"}
+          </button>
+        </div>
       </header>
 
       <div class="activity-list">
-        {#if activityItems.length === 0}
-          <p class="empty-state">No alerts or timeline events yet.</p>
+        {#if visibleAgentListItems.length === 0}
+          <p class="empty-state">No running agents right now.</p>
         {:else}
-          {#each activityItems as item (item.key)}
-            {#if item.kind === "alert"}
-              <article class="activity-item alert">
-                <p class="activity-title">
-                  Alert · {lookupAgentName(item.alert.agentId)} · Session #{item.alert.sessionId}
+          {#each visibleAgentListItems as item (item.agent.id)}
+            <article class="activity-item">
+              <div class="agent-item-head">
+                <p class="activity-title">{item.agent.name}</p>
+                <span class={`status status-pill ${item.status}`}>{toTitleCase(item.status)}</span>
+              </div>
+              <p class="activity-meta">Last seen: {item.lastSeen}</p>
+              {#if item.session}
+                <p class="activity-message">
+                  Session #{item.session.id} · {item.session.launchCommand}
                 </p>
-                <p class="activity-meta">{item.alert.reason} · {item.at}</p>
-                <p class="activity-message">{item.alert.message}</p>
                 <div class="activity-actions">
-                  <button class="ghost" onclick={() => focusSession(item.alert.sessionId)}>
+                  <button class="ghost" onclick={() => focusAgentById(item.agent.id, item.session?.id)}>
                     Open
                   </button>
-                  {#if item.alert.requiresAck && !item.alert.acknowledgedAt}
-                    <button class="ghost" onclick={() => acknowledgeAlert(item.alert.id)}>
-                      Ack
-                    </button>
-                  {/if}
-                  <button class="primary" onclick={() => resolveAlert(item.alert.id)}>Resolve</button>
                 </div>
-              </article>
-            {:else}
-              <article class="activity-item">
-                <p class="activity-title">Event · Session #{item.event.sessionId}</p>
-                <p class="activity-meta">{item.event.eventType} · {item.at}</p>
-                {#if item.event.message}
-                  <p class="activity-message">{item.event.message}</p>
-                {/if}
-              </article>
-            {/if}
+              {:else}
+                <p class="activity-message">No sessions yet.</p>
+              {/if}
+            </article>
           {/each}
         {/if}
       </div>
@@ -1065,8 +1007,11 @@
 </main>
 
 <style>
+  :global(html),
   :global(body) {
+    height: 100%;
     margin: 0;
+    overflow: hidden;
     background: #0b1118;
     color: #dde7ef;
     font-family: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
@@ -1077,11 +1022,12 @@
   }
 
   .app-shell {
-    min-height: 100vh;
+    height: 100vh;
     padding: 14px;
     display: flex;
     flex-direction: column;
     gap: 12px;
+    overflow: hidden;
     background-image: radial-gradient(circle at 12% 10%, rgba(47, 212, 195, 0.12), transparent 34%),
       radial-gradient(circle at 92% 2%, rgba(255, 184, 92, 0.12), transparent 36%);
   }
@@ -1089,6 +1035,7 @@
   .workspace {
     flex: 1;
     min-height: 0;
+    overflow: hidden;
     display: grid;
     grid-template-columns: minmax(560px, 1.9fr) minmax(280px, 1fr);
     gap: 12px;
@@ -1105,6 +1052,12 @@
     flex-direction: column;
     gap: 10px;
     backdrop-filter: blur(12px);
+  }
+
+  .activity-pane {
+    background: linear-gradient(180deg, rgba(10, 18, 28, 0.94) 0%, rgba(8, 14, 22, 0.94) 100%);
+    border-color: rgba(127, 164, 202, 0.36);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
   }
 
   .pane-header {
@@ -1199,14 +1152,15 @@
   .terminal-widget {
     flex: 1;
     min-height: 300px;
-    overflow: auto;
+    overflow: hidden;
     background: #060b12;
     border: 1px solid rgba(123, 161, 199, 0.3);
     border-radius: 12px;
-    padding: 8px;
+    padding: 0;
   }
 
   :global(.terminal-widget .xterm) {
+    width: 100%;
     height: 100%;
   }
 
@@ -1230,22 +1184,38 @@
     min-height: 0;
     overflow-y: auto;
     display: grid;
+    grid-template-columns: 1fr;
+    grid-auto-rows: 120px;
+    align-content: start;
     gap: 8px;
     padding-right: 4px;
   }
 
   .activity-item {
+    height: 120px;
     border-radius: 12px;
-    padding: 10px;
-    background: rgba(14, 23, 33, 0.85);
-    border: 1px solid rgba(113, 140, 168, 0.28);
-    display: grid;
+    padding: 10px 11px;
+    background: linear-gradient(165deg, rgba(17, 28, 41, 0.96) 0%, rgba(12, 20, 31, 0.96) 100%);
+    border: 1px solid rgba(122, 155, 187, 0.34);
+    display: flex;
+    flex-direction: column;
     gap: 6px;
+    overflow: hidden;
+    transition: border-color 140ms ease, transform 140ms ease, box-shadow 140ms ease;
   }
 
-  .activity-item.alert {
-    border-color: rgba(255, 184, 92, 0.45);
-    background: rgba(46, 33, 12, 0.42);
+  .activity-item:hover {
+    border-color: rgba(47, 212, 195, 0.56);
+    transform: translateY(-1px);
+    box-shadow: 0 6px 14px rgba(3, 10, 18, 0.35);
+  }
+
+  .agent-item-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 8px;
+    min-height: 22px;
   }
 
   .activity-title,
@@ -1256,22 +1226,47 @@
 
   .activity-title {
     font-size: 13px;
-    font-weight: 600;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .activity-meta {
-    font-size: 12px;
-    color: rgba(221, 231, 239, 0.66);
+    font-size: 11px;
+    color: rgba(221, 231, 239, 0.7);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .activity-message {
     font-size: 12px;
-    color: rgba(221, 231, 239, 0.88);
+    color: rgba(226, 235, 242, 0.9);
+    display: -webkit-box;
+    line-clamp: 1;
+    -webkit-line-clamp: 1;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
 
   .activity-actions {
     display: flex;
     gap: 8px;
+    margin-top: auto;
+  }
+
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 999px;
+    border: 1px solid rgba(128, 160, 190, 0.5);
+    background: rgba(15, 24, 35, 0.95);
+    padding: 2px 8px;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
   }
 
   .voice-toolbar {
@@ -1318,12 +1313,17 @@
   }
 
   button {
-    border: none;
+    border: 1px solid rgba(118, 152, 184, 0.36);
     border-radius: 10px;
     padding: 8px 12px;
-    font-weight: 600;
+    font-weight: 700;
     cursor: pointer;
     font-size: 12px;
+    transition: border-color 130ms ease, transform 130ms ease, opacity 130ms ease;
+  }
+
+  button:not(:disabled):hover {
+    transform: translateY(-1px);
   }
 
   button:disabled {
@@ -1332,13 +1332,14 @@
   }
 
   .ghost {
-    background: rgba(133, 161, 190, 0.18);
+    background: rgba(133, 161, 190, 0.2);
     color: #e5edf4;
   }
 
   .primary {
-    background: #2fd4c3;
+    background: linear-gradient(180deg, #3ae0cd 0%, #2fd4c3 100%);
     color: #042926;
+    border-color: rgba(47, 212, 195, 0.52);
   }
 
   .status {
@@ -1363,6 +1364,33 @@
 
   .status.ended {
     color: rgba(221, 231, 239, 0.56);
+  }
+
+  .status.idle {
+    color: rgba(221, 231, 239, 0.56);
+  }
+
+  .status-pill.active {
+    border-color: rgba(47, 212, 195, 0.6);
+    background: rgba(11, 44, 40, 0.8);
+  }
+
+  .status-pill.waking,
+  .status-pill.stalled {
+    border-color: rgba(255, 184, 92, 0.62);
+    background: rgba(58, 43, 20, 0.78);
+  }
+
+  .status-pill.needs_input,
+  .status-pill.failed {
+    border-color: rgba(255, 123, 114, 0.62);
+    background: rgba(58, 24, 22, 0.78);
+  }
+
+  .status-pill.ended,
+  .status-pill.idle {
+    border-color: rgba(160, 173, 186, 0.5);
+    background: rgba(31, 41, 51, 0.75);
   }
 
   .empty-state {
@@ -1396,6 +1424,14 @@
     .voice-actions button,
     .voice-input button {
       flex: 1;
+    }
+
+    .activity-list {
+      grid-auto-rows: 112px;
+    }
+
+    .activity-item {
+      height: 112px;
     }
   }
 </style>
