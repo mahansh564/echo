@@ -436,10 +436,7 @@ impl VoiceManager {
                     &result,
                     "ok",
                 );
-                app.emit(
-                    "voice_action_executed",
-                    execution_event,
-                )?;
+                app.emit("voice_action_executed", execution_event)?;
                 self.set_state(app, VoiceRuntimeState::Listening)?;
                 Ok(result)
             }
@@ -450,10 +447,7 @@ impl VoiceManager {
                     &serde_json::json!({ "error": err.to_string() }),
                     "error",
                 );
-                app.emit(
-                    "voice_action_executed",
-                    execution_event,
-                )?;
+                app.emit("voice_action_executed", execution_event)?;
                 self.emit_error(app, err.to_string())?;
                 self.set_state(app, VoiceRuntimeState::Listening)?;
                 Err(err)
@@ -656,8 +650,8 @@ mod tests {
                 { "reason": "tool_confirmation" }
             ]
         });
-        let summary = build_spoken_status_summary("list_input_needed", &result)
-            .expect("summary must exist");
+        let summary =
+            build_spoken_status_summary("list_input_needed", &result).expect("summary must exist");
         assert!(summary.contains("3 unresolved input requests need attention."));
         assert!(summary.contains("approval needed"));
         assert!(summary.contains("auth needed"));

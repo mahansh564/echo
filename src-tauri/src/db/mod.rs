@@ -2,8 +2,9 @@ pub mod models;
 
 use anyhow::{anyhow, Result};
 use models::{AgentRow, ManagedSession, SessionAlert, SessionEvent, Task};
+use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool};
 use std::str::FromStr;
 
 #[derive(Clone)]
@@ -13,9 +14,64 @@ pub struct Db {
 
 const AGENT_SELECT_COLUMNS: &str = "id, name, state, provider, display_order, attention_state, task_id, active_session_id, last_snippet, last_input_required_at, updated_at";
 const MANAGED_SESSION_SELECT_COLUMNS: &str = "id, provider, status, launch_command, launch_args_json, cwd, pid, agent_id, task_id, last_heartbeat_at, started_at, ended_at, needs_input, input_reason, last_activity_at, transport, attach_count, failure_reason, metadata_json, created_at, updated_at";
-const SESSION_ALERT_SELECT_COLUMNS: &str = "id, session_id, agent_id, severity, reason, message, requires_ack, acknowledged_at, resolved_at, created_at, updated_at";
+const SESSION_ALERT_SELECT_COLUMNS: &str = "id, session_id, agent_id, severity, reason, message, requires_ack, acknowledged_at, snoozed_until, escalated_at, escalation_count, resolved_at, created_at, updated_at";
 
 impl Db {
+    async fn refresh_agent_attention_state_with_conn(
+        conn: &mut PoolConnection<Sqlite>,
+        agent_id: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "WITH flags AS (
+                SELECT
+                    EXISTS(
+                        SELECT 1
+                        FROM session_alerts sa
+                        WHERE sa.agent_id = ?
+                          AND sa.resolved_at IS NULL
+                          AND (sa.snoozed_until IS NULL OR sa.snoozed_until <= CURRENT_TIMESTAMP)
+                          AND LOWER(sa.severity) = 'critical'
+                    ) AS has_critical_alert,
+                    EXISTS(
+                        SELECT 1
+                        FROM session_alerts sa
+                        WHERE sa.agent_id = ?
+                          AND sa.resolved_at IS NULL
+                          AND (sa.snoozed_until IS NULL OR sa.snoozed_until <= CURRENT_TIMESTAMP)
+                    ) AS has_open_alert,
+                    EXISTS(
+                        SELECT 1
+                        FROM managed_sessions ms
+                        WHERE ms.agent_id = ?
+                          AND ms.needs_input = 1
+                          AND ms.status IN ('waking', 'active', 'stalled', 'needs_input')
+                    ) AS has_input_needed_session
+            )
+            UPDATE agents
+            SET attention_state = CASE
+                    WHEN (SELECT has_critical_alert FROM flags) = 1 THEN 'blocked'
+                    WHEN (SELECT has_open_alert FROM flags) = 1
+                      OR (SELECT has_input_needed_session FROM flags) = 1 THEN 'needs_input'
+                    ELSE 'ok'
+                END,
+                last_input_required_at = CASE
+                    WHEN (SELECT has_open_alert FROM flags) = 1
+                      OR (SELECT has_input_needed_session FROM flags) = 1
+                    THEN COALESCE(last_input_required_at, CURRENT_TIMESTAMP)
+                    ELSE last_input_required_at
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?",
+        )
+        .bind(agent_id)
+        .bind(agent_id)
+        .bind(agent_id)
+        .bind(agent_id)
+        .execute(&mut **conn)
+        .await?;
+        Ok(())
+    }
+
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = if database_url.starts_with("sqlite:") {
             let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
@@ -197,6 +253,7 @@ impl Db {
                 SELECT sa.agent_id, COUNT(*) AS unresolved_alert_count
                 FROM session_alerts sa
                 WHERE sa.resolved_at IS NULL
+                  AND (sa.snoozed_until IS NULL OR sa.snoozed_until <= CURRENT_TIMESTAMP)
                 GROUP BY sa.agent_id
             )
             SELECT
@@ -303,6 +360,23 @@ impl Db {
         Ok(())
     }
 
+    pub async fn mark_session_stalled_if_not_needs_input(&self, session_id: i64) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE managed_sessions
+             SET status = 'stalled',
+                 failure_reason = NULL,
+                 last_activity_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?
+               AND needs_input = 0
+               AND status IN ('waking', 'active', 'stalled')",
+        )
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn update_session_heartbeat(&self, session_id: i64) -> Result<()> {
         sqlx::query(
             "UPDATE managed_sessions SET last_heartbeat_at = CURRENT_TIMESTAMP, last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -343,16 +417,7 @@ impl Db {
         .await?;
 
         if let Some(agent_id) = row.agent_id {
-            sqlx::query(
-                "UPDATE agents
-                 SET attention_state = 'needs_input',
-                     last_input_required_at = CURRENT_TIMESTAMP,
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?",
-            )
-            .bind(agent_id)
-            .execute(&mut *conn)
-            .await?;
+            Self::refresh_agent_attention_state_with_conn(&mut conn, agent_id).await?;
         }
 
         sqlx::query(
@@ -393,22 +458,7 @@ impl Db {
         .await?;
 
         if let Some(agent_id) = row.agent_id {
-            sqlx::query(
-                "UPDATE agents
-                 SET attention_state = CASE
-                     WHEN EXISTS (
-                        SELECT 1 FROM session_alerts
-                        WHERE agent_id = ? AND resolved_at IS NULL
-                     ) THEN attention_state
-                     ELSE 'ok'
-                 END,
-                 updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?",
-            )
-            .bind(agent_id)
-            .bind(agent_id)
-            .execute(&mut *conn)
-            .await?;
+            Self::refresh_agent_attention_state_with_conn(&mut conn, agent_id).await?;
         }
         Ok(())
     }
@@ -623,33 +673,101 @@ impl Db {
         requires_ack: bool,
     ) -> Result<SessionAlert> {
         let mut conn = self.pool.acquire().await?;
-        sqlx::query(
-            "INSERT INTO session_alerts (session_id, agent_id, severity, reason, message, requires_ack) VALUES (?, ?, ?, ?, ?, ?)",
+        let linked_agent_id = match agent_id {
+            Some(id) => Some(id),
+            None => sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT agent_id FROM managed_sessions WHERE id = ?",
+            )
+            .bind(session_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten(),
+        };
+
+        let existing_alert_id = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM session_alerts
+             WHERE session_id = ?
+               AND reason = ?
+               AND message = ?
+               AND resolved_at IS NULL
+             ORDER BY id DESC
+             LIMIT 1",
         )
         .bind(session_id)
-        .bind(agent_id)
-        .bind(severity)
         .bind(reason)
         .bind(message)
-        .bind(requires_ack)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        let alert = if let Some(alert_id) = existing_alert_id {
+            sqlx::query(
+                "UPDATE session_alerts
+                 SET severity = ?,
+                     requires_ack = ?,
+                     agent_id = COALESCE(agent_id, ?),
+                     snoozed_until = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?",
+            )
+            .bind(severity)
+            .bind(requires_ack)
+            .bind(linked_agent_id)
+            .bind(alert_id)
+            .execute(&mut *conn)
+            .await?;
+
+            sqlx::query_as::<_, SessionAlert>(&format!(
+                "SELECT {} FROM session_alerts WHERE id = ?",
+                SESSION_ALERT_SELECT_COLUMNS
+            ))
+            .bind(alert_id)
+            .fetch_one(&mut *conn)
+            .await?
+        } else {
+            sqlx::query(
+                "INSERT INTO session_alerts (session_id, agent_id, severity, reason, message, requires_ack) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(session_id)
+            .bind(linked_agent_id)
+            .bind(severity)
+            .bind(reason)
+            .bind(message)
+            .bind(requires_ack)
+            .execute(&mut *conn)
+            .await?;
+
+            sqlx::query_as::<_, SessionAlert>(&format!(
+                "SELECT {} FROM session_alerts WHERE id = last_insert_rowid()",
+                SESSION_ALERT_SELECT_COLUMNS
+            ))
+            .fetch_one(&mut *conn)
+            .await?
+        };
+
+        if let Some(agent_id) = alert.agent_id {
+            Self::refresh_agent_attention_state_with_conn(&mut conn, agent_id).await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO session_events (session_id, event_type, message, payload_json)
+             VALUES (?, 'session_alert_upserted', ?, ?)",
+        )
+        .bind(session_id)
+        .bind(Some("structured alert persisted"))
+        .bind(Some(
+            serde_json::json!({
+                "alertId": alert.id,
+                "agentId": alert.agent_id,
+                "severity": alert.severity,
+                "reason": alert.reason,
+                "message": alert.message,
+                "requiresAck": alert.requires_ack
+            })
+            .to_string(),
+        ))
         .execute(&mut *conn)
         .await?;
 
-        if let Some(agent_id) = agent_id {
-            sqlx::query(
-                "UPDATE agents SET attention_state = 'needs_input', last_input_required_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            )
-            .bind(agent_id)
-            .execute(&mut *conn)
-            .await?;
-        }
-
-        let alert = sqlx::query_as::<_, SessionAlert>(&format!(
-            "SELECT {} FROM session_alerts WHERE id = last_insert_rowid()",
-            SESSION_ALERT_SELECT_COLUMNS
-        ))
-        .fetch_one(&mut *conn)
-        .await?;
         Ok(alert)
     }
 
@@ -674,6 +792,69 @@ impl Db {
         self.get_session_alert(alert_id).await
     }
 
+    pub async fn snooze_session_alert(
+        &self,
+        alert_id: i64,
+        duration_minutes: i64,
+    ) -> Result<SessionAlert> {
+        let clamped_minutes = duration_minutes.max(1).min(24 * 60);
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "UPDATE session_alerts
+             SET snoozed_until = datetime(CURRENT_TIMESTAMP, '+' || ? || ' minutes'),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(clamped_minutes)
+        .bind(alert_id)
+        .execute(&mut *conn)
+        .await?;
+
+        let alert = sqlx::query_as::<_, SessionAlert>(&format!(
+            "SELECT {} FROM session_alerts WHERE id = ?",
+            SESSION_ALERT_SELECT_COLUMNS
+        ))
+        .bind(alert_id)
+        .fetch_one(&mut *conn)
+        .await?;
+
+        if let Some(agent_id) = alert.agent_id {
+            Self::refresh_agent_attention_state_with_conn(&mut conn, agent_id).await?;
+        }
+
+        Ok(alert)
+    }
+
+    pub async fn escalate_session_alert(&self, alert_id: i64) -> Result<SessionAlert> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "UPDATE session_alerts
+             SET severity = 'critical',
+                 escalated_at = CURRENT_TIMESTAMP,
+                 escalation_count = escalation_count + 1,
+                 snoozed_until = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(alert_id)
+        .execute(&mut *conn)
+        .await?;
+
+        let alert = sqlx::query_as::<_, SessionAlert>(&format!(
+            "SELECT {} FROM session_alerts WHERE id = ?",
+            SESSION_ALERT_SELECT_COLUMNS
+        ))
+        .bind(alert_id)
+        .fetch_one(&mut *conn)
+        .await?;
+
+        if let Some(agent_id) = alert.agent_id {
+            Self::refresh_agent_attention_state_with_conn(&mut conn, agent_id).await?;
+        }
+
+        Ok(alert)
+    }
+
     pub async fn resolve_session_alert(&self, alert_id: i64) -> Result<SessionAlert> {
         let mut conn = self.pool.acquire().await?;
         sqlx::query(
@@ -692,22 +873,7 @@ impl Db {
         .await?;
 
         if let Some(agent_id) = alert.agent_id {
-            sqlx::query(
-                "UPDATE agents
-                 SET attention_state = CASE
-                     WHEN EXISTS (
-                        SELECT 1 FROM session_alerts
-                        WHERE agent_id = ? AND resolved_at IS NULL
-                     ) THEN attention_state
-                     ELSE 'ok'
-                 END,
-                 updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?",
-            )
-            .bind(agent_id)
-            .bind(agent_id)
-            .execute(&mut *conn)
-            .await?;
+            Self::refresh_agent_attention_state_with_conn(&mut conn, agent_id).await?;
         }
 
         Ok(alert)
@@ -747,7 +913,12 @@ impl Db {
         let alerts = match (agent_id, unresolved_only) {
             (Some(agent_id), true) => {
                 sqlx::query_as::<_, SessionAlert>(&format!(
-                    "SELECT {} FROM session_alerts WHERE resolved_at IS NULL AND agent_id = ? ORDER BY created_at DESC LIMIT ?",
+                    "SELECT {} FROM session_alerts
+                     WHERE resolved_at IS NULL
+                       AND (snoozed_until IS NULL OR snoozed_until <= CURRENT_TIMESTAMP)
+                       AND agent_id = ?
+                     ORDER BY created_at DESC
+                     LIMIT ?",
                     SESSION_ALERT_SELECT_COLUMNS
                 ))
                 .bind(agent_id)
@@ -757,9 +928,9 @@ impl Db {
             }
             (Some(agent_id), false) => {
                 sqlx::query_as::<_, SessionAlert>(&format!(
-                    "SELECT {} FROM session_alerts WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
-                    SESSION_ALERT_SELECT_COLUMNS
-                ))
+                "SELECT {} FROM session_alerts WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
+                SESSION_ALERT_SELECT_COLUMNS
+            ))
                 .bind(agent_id)
                 .bind(max)
                 .fetch_all(&self.pool)
@@ -767,7 +938,11 @@ impl Db {
             }
             (None, true) => {
                 sqlx::query_as::<_, SessionAlert>(&format!(
-                    "SELECT {} FROM session_alerts WHERE resolved_at IS NULL ORDER BY created_at DESC LIMIT ?",
+                    "SELECT {} FROM session_alerts
+                     WHERE resolved_at IS NULL
+                       AND (snoozed_until IS NULL OR snoozed_until <= CURRENT_TIMESTAMP)
+                     ORDER BY created_at DESC
+                     LIMIT ?",
                     SESSION_ALERT_SELECT_COLUMNS
                 ))
                 .bind(max)

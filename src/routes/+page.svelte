@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
+  import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { onMount, tick } from "svelte";
   import { Terminal } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
@@ -127,6 +128,44 @@
     at: string;
   };
 
+  type SessionAlert = {
+    id: number;
+    sessionId: number;
+    agentId?: number | null;
+    severity: string;
+    reason: string;
+    message: string;
+    requiresAck: boolean;
+    acknowledgedAt?: string | null;
+    snoozedUntil?: string | null;
+    escalatedAt?: string | null;
+    escalationCount?: number;
+    resolvedAt?: string | null;
+    createdAt: string;
+    updatedAt: string;
+  };
+
+  type SessionAlertCreatedEvent = {
+    alertId: number;
+    sessionId: number;
+    agentId?: number | null;
+    severity: string;
+    reason: string;
+    message: string;
+    requiresAck: boolean;
+    createdAt: string;
+  };
+
+  type AlertToast = {
+    id: string;
+    alertId: number;
+    sessionId: number;
+    agentId?: number | null;
+    severity: string;
+    reason: string;
+    message: string;
+  };
+
   type TerminalViewportState = {
     selectedSessionId: number | null;
     cursors: Map<number, number>;
@@ -145,10 +184,48 @@
     lastSeen: string;
   };
 
+  type PaletteCommandId = "show-unresolved-inputs" | "voice-query-input-needed";
+
+  type PaletteCommand = {
+    id: PaletteCommandId;
+    label: string;
+    meta: string;
+  };
+
+  type PaletteEntry =
+    | {
+        id: string;
+        kind: "command";
+        label: string;
+        meta: string;
+        commandId: PaletteCommandId;
+      }
+    | {
+        id: string;
+        kind: "alert";
+        label: string;
+        meta: string;
+        alert: SessionAlert;
+      };
+
+  const COMMAND_PALETTE_COMMANDS: PaletteCommand[] = [
+    {
+      id: "show-unresolved-inputs",
+      label: "Show unresolved input alerts",
+      meta: "Refresh unresolved alerts from active sessions"
+    },
+    {
+      id: "voice-query-input-needed",
+      label: "Ask voice: which agents need input",
+      meta: "Runs the voice query for unresolved input requests"
+    }
+  ];
+
   let agents = $state<AgentRow[]>([]);
   let sessions = $state<SessionRuntime[]>([]);
   let selectedAgentId = $state<number>(0);
   let loading = $state<boolean>(true);
+  let hasLoadedOnce = $state<boolean>(false);
   let voiceRunning = $state<boolean>(false);
   let voiceState = $state<string>("idle");
   let lastTranscript = $state<string>("");
@@ -162,6 +239,14 @@
   let terminalInput = $state<string>("");
   let terminalContainer: HTMLDivElement | null = $state(null);
   let showClosedAgents = $state<boolean>(false);
+  let showCommandPalette = $state<boolean>(false);
+  let paletteQuery = $state<string>("");
+  let paletteSelectedIndex = $state<number>(0);
+  let paletteInput: HTMLInputElement | null = $state(null);
+  let unresolvedAlerts = $state<SessionAlert[]>([]);
+  let unresolvedAlertsLoading = $state<boolean>(false);
+  let alertActionBusyId = $state<number | null>(null);
+  let alertToasts = $state<AlertToast[]>([]);
 
   let terminalWidget: Terminal | null = null;
   let fitAddon: FitAddon | null = null;
@@ -181,6 +266,11 @@
   const TERMINAL_MAX_DRAIN_ITERATIONS = 8;
   const TERMINAL_FRAME_WRITE_BUDGET_BYTES = 32_768;
   const TERMINAL_MAX_PENDING_CHUNKS = 512;
+  const TERMINAL_POPOUT_WINDOW_LABEL = "terminal-popout";
+  const ALERT_TOAST_MAX = 4;
+  const ALERT_TOAST_TTL_MS = 8000;
+
+  const alertToastTimers = new Map<string, number>();
 
   const ACTIVE_SESSION_STATUSES = new Set<SessionRuntime["status"]>([
     "waking",
@@ -276,12 +366,20 @@
     }));
   };
 
-  async function loadData() {
-    loading = true;
+  async function loadData(options: { background?: boolean } = {}) {
+    const background = options.background ?? hasLoadedOnce;
+    if (!background) {
+      loading = true;
+    }
     try {
-      const [agentRowsResponse, sessionsResponse] = await Promise.all([
+      const [agentRowsResponse, sessionsResponse, alertsResponse] = await Promise.all([
         invoke("list_agent_rows_cmd", { limit: 200 }),
-        invoke("list_managed_sessions_cmd", { status: null, limit: 200 })
+        invoke("list_managed_sessions_cmd", { status: null, limit: 200 }),
+        invoke("list_session_alerts_cmd", {
+          agentId: null,
+          unresolvedOnly: true,
+          limit: 200
+        })
       ]);
 
       const mappedAgents = (agentRowsResponse as AgentRowPayload[]).map((row) => ({
@@ -305,6 +403,7 @@
 
       applyRelativeTimes(mappedAgents);
       sessions = sessionsResponse as SessionRuntime[];
+      unresolvedAlerts = alertsResponse as SessionAlert[];
 
       if (agents.length > 0 && !agents.some((agent) => agent.id === selectedAgentId)) {
         selectedAgentId = agents[0].id;
@@ -329,29 +428,35 @@
       } else if (nextSessionId === null) {
         clearTerminalView();
       }
+      hasLoadedOnce = true;
     } catch (error) {
       console.error("Failed to load data", error);
+      unresolvedAlerts = [];
     } finally {
-      loading = false;
+      if (!background) {
+        loading = false;
+      }
     }
   }
 
   async function startSession(
     agentId?: number,
     taskId?: number,
-    options: { command?: string | null } = {}
+    options: { command?: string | null; provider?: string | null } = {}
   ) {
     if (!agentId) return;
-    const command = options.command?.trim() || "opencode";
+    const targetAgent = agents.find((agent) => agent.id === agentId);
+    const provider = options.provider?.trim() || targetAgent?.provider || "opencode";
+    const command = options.command?.trim() ?? "";
     try {
       await invoke("start_agent_session_cmd", {
         agentId,
         launchProfile: {
-          command,
+          command: command.length > 0 ? command : null,
           args: [],
           cwd: null,
           taskId: taskId ?? null,
-          provider: "opencode"
+          provider
         }
       });
       await loadData();
@@ -362,6 +467,218 @@
 
   const lookupAgentName = (agentId?: number | null) =>
     agents.find((agent) => agent.id === agentId)?.name ?? "Unassigned";
+
+  const filterIncludes = (value: string, query: string) => value.toLowerCase().includes(query);
+
+  const paletteEntries = $derived.by((): PaletteEntry[] => {
+    const query = paletteQuery.trim().toLowerCase();
+    const commands = COMMAND_PALETTE_COMMANDS.filter(
+      (command) =>
+        !query || filterIncludes(command.label, query) || filterIncludes(command.meta, query)
+    ).map((command) => ({
+      id: `command-${command.id}`,
+      kind: "command" as const,
+      label: command.label,
+      meta: command.meta,
+      commandId: command.id
+    }));
+
+    const alerts = unresolvedAlerts
+      .filter((alert) => {
+        if (!query) return true;
+        const agentName = lookupAgentName(alert.agentId);
+        const haystack = `${agentName} ${alert.reason} ${alert.message} ${alert.sessionId}`.toLowerCase();
+        return haystack.includes(query);
+      })
+      .slice(0, 20)
+      .map((alert) => ({
+        id: `alert-${alert.id}`,
+        kind: "alert" as const,
+        label: `${lookupAgentName(alert.agentId)} · ${toTitleCase(alert.reason)}`,
+        meta: `Session #${alert.sessionId} · ${alert.message}`,
+        alert
+      }));
+
+    return [...commands, ...alerts];
+  });
+
+  $effect(() => {
+    const maxIndex = Math.max(0, paletteEntries.length - 1);
+    if (paletteSelectedIndex > maxIndex) {
+      paletteSelectedIndex = maxIndex;
+    }
+  });
+
+  async function loadUnresolvedAlerts() {
+    unresolvedAlertsLoading = true;
+    try {
+      const alerts = (await invoke("list_session_alerts_cmd", {
+        agentId: null,
+        unresolvedOnly: true,
+        limit: 200
+      })) as SessionAlert[];
+      unresolvedAlerts = alerts;
+    } catch (error) {
+      console.error("Failed to load unresolved alerts", error);
+      unresolvedAlerts = [];
+    } finally {
+      unresolvedAlertsLoading = false;
+    }
+  }
+
+  function dismissAlertToast(toastId: string) {
+    alertToasts = alertToasts.filter((toast) => toast.id !== toastId);
+    const timer = alertToastTimers.get(toastId);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      alertToastTimers.delete(toastId);
+    }
+  }
+
+  function upsertUnresolvedAlertFromEvent(payload: SessionAlertCreatedEvent) {
+    const mapped: SessionAlert = {
+      id: payload.alertId,
+      sessionId: payload.sessionId,
+      agentId: payload.agentId ?? null,
+      severity: payload.severity,
+      reason: payload.reason,
+      message: payload.message,
+      requiresAck: payload.requiresAck,
+      acknowledgedAt: null,
+      snoozedUntil: null,
+      escalatedAt: null,
+      escalationCount: 0,
+      resolvedAt: null,
+      createdAt: payload.createdAt,
+      updatedAt: payload.createdAt
+    };
+    unresolvedAlerts = [
+      mapped,
+      ...unresolvedAlerts.filter((entry) => entry.id !== mapped.id)
+    ].slice(0, 200);
+  }
+
+  function enqueueAlertToast(payload: SessionAlertCreatedEvent) {
+    const toastId = `${payload.alertId}-${Date.now()}`;
+    const toast: AlertToast = {
+      id: toastId,
+      alertId: payload.alertId,
+      sessionId: payload.sessionId,
+      agentId: payload.agentId ?? null,
+      severity: payload.severity,
+      reason: payload.reason,
+      message: payload.message
+    };
+
+    const nextToasts = [toast, ...alertToasts];
+    const dropped = nextToasts.slice(ALERT_TOAST_MAX);
+    alertToasts = nextToasts.slice(0, ALERT_TOAST_MAX);
+    const timer = window.setTimeout(() => {
+      dismissAlertToast(toastId);
+    }, ALERT_TOAST_TTL_MS);
+    alertToastTimers.set(toastId, timer);
+
+    for (const entry of dropped) {
+      dismissAlertToast(entry.id);
+    }
+  }
+
+  function focusToastAlert(toast: AlertToast) {
+    dismissAlertToast(toast.id);
+    if (toast.agentId) {
+      focusAgentById(toast.agentId, toast.sessionId);
+      return;
+    }
+    void focusSession(toast.sessionId);
+  }
+
+  async function runAlertAction(
+    action: "acknowledge" | "snooze" | "escalate",
+    alertId: number
+  ) {
+    if (alertActionBusyId !== null) return;
+    alertActionBusyId = alertId;
+    try {
+      if (action === "acknowledge") {
+        await invoke("acknowledge_session_alert_cmd", { alertId });
+      } else if (action === "snooze") {
+        await invoke("snooze_session_alert_cmd", { alertId, durationMinutes: 30 });
+      } else {
+        await invoke("escalate_session_alert_cmd", { alertId });
+      }
+      await loadData();
+    } catch (error) {
+      console.error(`Failed to ${action} alert`, error);
+    } finally {
+      alertActionBusyId = null;
+    }
+  }
+
+  async function runPaletteCommand(commandId: PaletteCommandId) {
+    switch (commandId) {
+      case "show-unresolved-inputs":
+        await loadUnresolvedAlerts();
+        break;
+      case "voice-query-input-needed":
+        closeCommandPalette();
+        await runVoiceText("which agents need input", { pushToTalk: true });
+        break;
+      default:
+        break;
+    }
+  }
+
+  async function runPaletteEntry(entry?: PaletteEntry) {
+    if (!entry) return;
+    if (entry.kind === "command") {
+      await runPaletteCommand(entry.commandId);
+      return;
+    }
+    closeCommandPalette();
+    if (entry.alert.agentId) {
+      focusAgentById(entry.alert.agentId, entry.alert.sessionId);
+      return;
+    }
+    await focusSession(entry.alert.sessionId);
+  }
+
+  async function openCommandPalette() {
+    showCommandPalette = true;
+    paletteQuery = "";
+    paletteSelectedIndex = 0;
+    await loadUnresolvedAlerts();
+    await tick();
+    paletteInput?.focus();
+  }
+
+  function closeCommandPalette() {
+    showCommandPalette = false;
+    paletteQuery = "";
+    paletteSelectedIndex = 0;
+  }
+
+  async function handlePaletteInputKeydown(event: KeyboardEvent) {
+    if (!showCommandPalette) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      paletteSelectedIndex = Math.min(paletteSelectedIndex + 1, Math.max(0, paletteEntries.length - 1));
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      paletteSelectedIndex = Math.max(paletteSelectedIndex - 1, 0);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      await runPaletteEntry(paletteEntries[paletteSelectedIndex]);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeCommandPalette();
+    }
+  }
 
   function upsertSessionRuntime(session: SessionRuntime) {
     const existing = sessions.find((entry) => entry.id === session.id);
@@ -420,6 +737,38 @@
 
     if (reset || terminalCursorBySession.get(sessionId) === undefined) {
       await hydrateTerminalSession(sessionId, { reset: true });
+    }
+  }
+
+  async function openTerminalPopout() {
+    if (!selectedSessionId) return;
+    const sessionId = selectedSessionId;
+    const popoutUrl = `/terminal-popout?sessionId=${sessionId}`;
+
+    try {
+      const existing = await WebviewWindow.getByLabel(TERMINAL_POPOUT_WINDOW_LABEL);
+      if (existing) {
+        await existing.emit("terminal-popout-focus-session", { sessionId });
+        return;
+      }
+
+      const popout = new WebviewWindow(TERMINAL_POPOUT_WINDOW_LABEL, {
+        title: `Terminal Session #${sessionId}`,
+        url: popoutUrl,
+        width: 1180,
+        height: 760,
+        minWidth: 860,
+        minHeight: 520,
+        resizable: true,
+        focus: true
+      });
+
+      popout.once("tauri://error", (event) => {
+        console.error("Failed to create terminal popout window", event.payload);
+      });
+    } catch (error) {
+      console.error("Terminal popout unavailable in this context", error);
+      window.open(popoutUrl, "_blank", "noopener,noreferrer");
     }
   }
 
@@ -722,11 +1071,29 @@
     }
   }
 
+  function handleGlobalKeydown(event: KeyboardEvent) {
+    const lowered = event.key.toLowerCase();
+    if ((event.metaKey || event.ctrlKey) && lowered === "k") {
+      event.preventDefault();
+      if (showCommandPalette) {
+        closeCommandPalette();
+      } else {
+        void openCommandPalette();
+      }
+      return;
+    }
+    if (event.key === "Escape" && showCommandPalette) {
+      event.preventDefault();
+      closeCommandPalette();
+    }
+  }
+
   onMount(() => {
     let unlistenTask: (() => void) | undefined;
     let unlistenAgent: (() => void) | undefined;
     let unlistenTerminal: (() => void) | undefined;
     let unlistenSession: (() => void) | undefined;
+    let unlistenSessionAlertCreated: (() => void) | undefined;
     let unlistenSessionPrompt: (() => void) | undefined;
     let unlistenVoiceState: (() => void) | undefined;
     let unlistenVoiceTranscript: (() => void) | undefined;
@@ -750,10 +1117,19 @@
       });
       unlistenSession = await listen("agent_runtime_updated", (event) => {
         const payload = event.payload as AgentRuntimeUpdatedEvent;
-        if (payload.activeSessionId && selectedAgentId === payload.agentId) {
-          void setSelectedSession(payload.activeSessionId, { reset: true });
+        if (
+          payload.activeSessionId &&
+          selectedAgentId === payload.agentId &&
+          selectedSessionId !== payload.activeSessionId
+        ) {
+          void setSelectedSession(payload.activeSessionId, { reset: false });
         }
-        void loadData();
+        void loadData({ background: true });
+      });
+      unlistenSessionAlertCreated = await listen("session_alert_created", (event) => {
+        const payload = event.payload as SessionAlertCreatedEvent;
+        upsertUnresolvedAlertFromEvent(payload);
+        enqueueAlertToast(payload);
       });
       unlistenSessionPrompt = await listen("managed_session_prompt_required", async (event) => {
         const payload = event.payload as ManagedSessionPromptRequiredEvent;
@@ -785,10 +1161,7 @@
       unlistenVoiceCommand = await listen("voice_action_executed", (event) => {
         const payload = event.payload as VoiceAction;
         lastCommand = `${payload.action} (${payload.result})`;
-        if (payload.targetAgentId) {
-          focusAgentById(payload.targetAgentId, payload.targetSessionId ?? undefined);
-        }
-        void loadData();
+        void loadData({ background: true });
       });
       unlistenVoiceError = await listen("voice_error", (event) => {
         const payload = event.payload as { message: string };
@@ -797,9 +1170,6 @@
       unlistenVoiceReply = await listen("voice_status_reply", (event) => {
         const payload = event.payload as VoiceStatusReplyEvent;
         lastCommand = payload.summary;
-        if (payload.targetAgentId) {
-          focusAgentById(payload.targetAgentId);
-        }
       });
     };
 
@@ -816,7 +1186,9 @@
         console.error("Failed to get voice status", error);
       });
 
-    const interval = setInterval(loadData, 8000);
+    const interval = setInterval(() => {
+      void loadData({ background: true });
+    }, 8000);
     void loadData();
 
     const resizeObserver =
@@ -832,10 +1204,12 @@
     if (resizeObserver && terminalContainer) {
       resizeObserver.observe(terminalContainer);
     }
+    window.addEventListener("keydown", handleGlobalKeydown);
 
     return () => {
       clearInterval(interval);
       resizeObserver?.disconnect();
+      window.removeEventListener("keydown", handleGlobalKeydown);
       if (terminalFlushRaf) {
         window.cancelAnimationFrame(terminalFlushRaf);
         terminalFlushRaf = 0;
@@ -854,6 +1228,7 @@
       unlistenAgent?.();
       unlistenTerminal?.();
       unlistenSession?.();
+      unlistenSessionAlertCreated?.();
       unlistenSessionPrompt?.();
       unlistenVoiceState?.();
       unlistenVoiceTranscript?.();
@@ -861,11 +1236,30 @@
       unlistenVoiceCommand?.();
       unlistenVoiceError?.();
       unlistenVoiceReply?.();
+      for (const timer of alertToastTimers.values()) {
+        window.clearTimeout(timer);
+      }
+      alertToastTimers.clear();
     };
   });
 </script>
 
 <main class="app-shell">
+  {#if alertToasts.length > 0}
+    <section class="alert-toast-stack" aria-live="polite" aria-label="Input required alerts">
+      {#each alertToasts as toast (toast.id)}
+        <article class={`alert-toast severity-${toast.severity.toLowerCase()}`}>
+          <button class="alert-toast-open" onclick={() => focusToastAlert(toast)}>
+            <strong>{lookupAgentName(toast.agentId)} · {toTitleCase(toast.reason)}</strong>
+            <p>{toast.message}</p>
+            <span>Session #{toast.sessionId}</span>
+          </button>
+          <button class="ghost compact" onclick={() => dismissAlertToast(toast.id)}>Dismiss</button>
+        </article>
+      {/each}
+    </section>
+  {/if}
+
   <section class="workspace">
     <section class="terminals-pane">
       <header class="pane-header">
@@ -912,9 +1306,12 @@
               No session selected
             {/if}
           </strong>
-          {#if selectedSession}
-            <span class={`status ${selectedSession.status}`}>{toTitleCase(selectedSession.status)}</span>
-          {/if}
+          <div class="terminal-view-actions">
+            {#if selectedSession}
+              <button class="ghost compact" onclick={openTerminalPopout}>Pop out</button>
+              <span class={`status ${selectedSession.status}`}>{toTitleCase(selectedSession.status)}</span>
+            {/if}
+          </div>
         </header>
 
         <div class="terminal-widget" bind:this={terminalContainer}></div>
@@ -969,6 +1366,62 @@
           {/each}
         {/if}
       </div>
+
+      <section class="alerts-panel" aria-label="Unresolved input alerts">
+        <header class="alerts-panel-header">
+          <h3>Input alerts</h3>
+          <span>{unresolvedAlerts.length}</span>
+        </header>
+        {#if unresolvedAlertsLoading && unresolvedAlerts.length === 0}
+          <p class="empty-state">Loading unresolved alerts...</p>
+        {:else if unresolvedAlerts.length === 0}
+          <p class="empty-state">No unresolved input alerts.</p>
+        {:else}
+          <div class="alerts-list">
+            {#each unresolvedAlerts.slice(0, 6) as alert (alert.id)}
+              <article class={`alert-item severity-${alert.severity.toLowerCase()}`}>
+                <button
+                  class="alert-open"
+                  onclick={() => {
+                    if (alert.agentId) {
+                      focusAgentById(alert.agentId, alert.sessionId);
+                    } else {
+                      void focusSession(alert.sessionId);
+                    }
+                  }}
+                >
+                  <strong>{lookupAgentName(alert.agentId)} · {toTitleCase(alert.reason)}</strong>
+                  <p>Session #{alert.sessionId} · {toTitleCase(alert.severity)}</p>
+                  <p>{alert.message}</p>
+                </button>
+                <div class="alert-item-actions">
+                  <button
+                    class="ghost compact"
+                    onclick={() => void runAlertAction("acknowledge", alert.id)}
+                    disabled={alertActionBusyId !== null || !!alert.acknowledgedAt}
+                  >
+                    {alert.acknowledgedAt ? "Acked" : "Acknowledge"}
+                  </button>
+                  <button
+                    class="ghost compact"
+                    onclick={() => void runAlertAction("snooze", alert.id)}
+                    disabled={alertActionBusyId !== null}
+                  >
+                    Snooze 30m
+                  </button>
+                  <button
+                    class="ghost compact"
+                    onclick={() => void runAlertAction("escalate", alert.id)}
+                    disabled={alertActionBusyId !== null || alert.severity.toLowerCase() === "critical"}
+                  >
+                    {alert.severity.toLowerCase() === "critical" ? "Escalated" : "Escalate"}
+                  </button>
+                </div>
+              </article>
+            {/each}
+          </div>
+        {/if}
+      </section>
     </aside>
   </section>
 
@@ -986,6 +1439,7 @@
       {:else}
         <button class="ghost" onclick={startVoice}>Start voice</button>
       {/if}
+      <button class="ghost" onclick={() => void openCommandPalette()}>Palette (Cmd/Ctrl+K)</button>
       <button class="ghost" onclick={pushToTalkVoiceText} disabled={pushToTalkBusy}>
         {pushToTalkBusy ? "Listening..." : "Push to talk"}
       </button>
@@ -1000,6 +1454,56 @@
       <button class="primary" onclick={submitVoiceText}>Run</button>
     </div>
   </section>
+
+  {#if showCommandPalette}
+    <div
+      class="command-palette-backdrop"
+      role="presentation"
+      onclick={(event) => {
+        if (event.target === event.currentTarget) {
+          closeCommandPalette();
+        }
+      }}
+    >
+      <dialog open class="command-palette" aria-label="Command palette">
+        <header class="command-palette-header">
+          <input
+            bind:this={paletteInput}
+            bind:value={paletteQuery}
+            placeholder="Search commands or unresolved alerts"
+            oninput={() => {
+              paletteSelectedIndex = 0;
+            }}
+            onkeydown={handlePaletteInputKeydown}
+          />
+          <button class="ghost compact" onclick={closeCommandPalette}>Close</button>
+        </header>
+        <p class="command-palette-hint">Enter to run. Arrow keys to navigate.</p>
+        <div class="command-palette-list">
+          {#if unresolvedAlertsLoading}
+            <p class="empty-state">Loading unresolved alerts...</p>
+          {:else if paletteEntries.length === 0}
+            <p class="empty-state">No matching commands or alerts.</p>
+          {:else}
+            {#each paletteEntries as entry, index (entry.id)}
+              <button
+                class="command-palette-item"
+                class:selected={index === paletteSelectedIndex}
+                onclick={() => void runPaletteEntry(entry)}
+                onmousemove={() => (paletteSelectedIndex = index)}
+              >
+                <div class="command-palette-copy">
+                  <strong>{entry.label}</strong>
+                  <p>{entry.meta}</p>
+                </div>
+                <span class="command-palette-kind">{entry.kind === "command" ? "Command" : "Alert"}</span>
+              </button>
+            {/each}
+          {/if}
+        </div>
+      </dialog>
+    </div>
+  {/if}
 
   {#if loading}
     <p class="loading">Refreshing…</p>
@@ -1030,6 +1534,65 @@
     overflow: hidden;
     background-image: radial-gradient(circle at 12% 10%, rgba(47, 212, 195, 0.12), transparent 34%),
       radial-gradient(circle at 92% 2%, rgba(255, 184, 92, 0.12), transparent 36%);
+  }
+
+  .alert-toast-stack {
+    position: fixed;
+    z-index: 60;
+    top: 16px;
+    right: 16px;
+    width: min(360px, calc(100vw - 32px));
+    display: grid;
+    gap: 8px;
+  }
+
+  .alert-toast {
+    border-radius: 12px;
+    border: 1px solid rgba(124, 157, 189, 0.38);
+    background: rgba(8, 15, 24, 0.96);
+    box-shadow: 0 14px 28px rgba(0, 0, 0, 0.35);
+    padding: 10px;
+    display: grid;
+    gap: 8px;
+  }
+
+  .alert-toast.severity-warning {
+    border-color: rgba(255, 184, 92, 0.64);
+  }
+
+  .alert-toast.severity-critical {
+    border-color: rgba(255, 123, 114, 0.72);
+    background: rgba(35, 13, 14, 0.95);
+  }
+
+  .alert-toast-open {
+    width: 100%;
+    border: 0;
+    border-radius: 8px;
+    padding: 0;
+    margin: 0;
+    background: transparent;
+    color: inherit;
+    text-align: left;
+    display: grid;
+    gap: 4px;
+    cursor: pointer;
+  }
+
+  .alert-toast-open strong,
+  .alert-toast-open p,
+  .alert-toast-open span {
+    margin: 0;
+  }
+
+  .alert-toast-open strong {
+    font-size: 12px;
+  }
+
+  .alert-toast-open p,
+  .alert-toast-open span {
+    font-size: 11px;
+    color: rgba(221, 231, 239, 0.84);
   }
 
   .workspace {
@@ -1149,6 +1712,12 @@
     color: rgba(221, 231, 239, 0.88);
   }
 
+  .terminal-view-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
   .terminal-widget {
     flex: 1;
     min-height: 300px;
@@ -1257,6 +1826,105 @@
     margin-top: auto;
   }
 
+  .alerts-panel {
+    border-top: 1px solid rgba(124, 157, 189, 0.26);
+    padding-top: 10px;
+    display: grid;
+    gap: 8px;
+  }
+
+  .alerts-panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .alerts-panel-header h3 {
+    margin: 0;
+    font-size: 12px;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+
+  .alerts-panel-header span {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgba(221, 231, 239, 0.7);
+  }
+
+  .alerts-list {
+    max-height: 260px;
+    overflow-y: auto;
+    display: grid;
+    gap: 7px;
+    padding-right: 4px;
+  }
+
+  .alert-item {
+    border-radius: 10px;
+    border: 1px solid rgba(124, 157, 189, 0.32);
+    background: rgba(12, 20, 31, 0.88);
+    padding: 8px;
+    display: grid;
+    gap: 8px;
+  }
+
+  .alert-item.severity-warning {
+    border-color: rgba(255, 184, 92, 0.5);
+  }
+
+  .alert-item.severity-critical {
+    border-color: rgba(255, 123, 114, 0.58);
+    background: rgba(34, 16, 16, 0.82);
+  }
+
+  .alert-open {
+    width: 100%;
+    border: 0;
+    border-radius: 8px;
+    padding: 0;
+    margin: 0;
+    text-align: left;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    transform: none;
+    display: grid;
+    gap: 4px;
+  }
+
+  .alert-open:not(:disabled):hover {
+    transform: none;
+  }
+
+  .alert-open strong,
+  .alert-open p {
+    margin: 0;
+  }
+
+  .alert-open strong {
+    font-size: 12px;
+    line-height: 1.3;
+  }
+
+  .alert-open p {
+    font-size: 11px;
+    color: rgba(221, 231, 239, 0.77);
+    display: -webkit-box;
+    line-clamp: 2;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .alert-item-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
   .status-pill {
     display: inline-flex;
     align-items: center;
@@ -1267,6 +1935,114 @@
     font-size: 10px;
     letter-spacing: 0.06em;
     white-space: nowrap;
+  }
+
+  .command-palette-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background: rgba(2, 5, 10, 0.68);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 10vh 16px 24px;
+  }
+
+  .command-palette {
+    width: min(760px, 100%);
+    max-height: min(68vh, 640px);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    border-radius: 14px;
+    border: 1px solid rgba(120, 160, 193, 0.38);
+    background: linear-gradient(180deg, rgba(10, 17, 27, 0.98) 0%, rgba(7, 12, 20, 0.98) 100%);
+    box-shadow: 0 26px 44px rgba(0, 0, 0, 0.45);
+    padding: 10px;
+  }
+
+  .command-palette-header {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+  }
+
+  .command-palette-header input {
+    border: 1px solid rgba(123, 161, 199, 0.55);
+    border-radius: 10px;
+    padding: 10px 12px;
+    background: rgba(11, 19, 29, 0.95);
+    color: inherit;
+    min-width: 0;
+  }
+
+  .command-palette-hint {
+    margin: 0;
+    padding: 0 2px;
+    font-size: 11px;
+    color: rgba(221, 231, 239, 0.72);
+  }
+
+  .command-palette-list {
+    min-height: 0;
+    overflow-y: auto;
+    display: grid;
+    gap: 6px;
+    padding-right: 4px;
+  }
+
+  .command-palette-item {
+    width: 100%;
+    border: 1px solid rgba(118, 152, 184, 0.32);
+    background: rgba(10, 17, 27, 0.82);
+    border-radius: 10px;
+    padding: 10px;
+    color: inherit;
+    text-align: left;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .command-palette-item.selected {
+    border-color: rgba(47, 212, 195, 0.86);
+    background: rgba(13, 35, 41, 0.9);
+  }
+
+  .command-palette-copy {
+    min-width: 0;
+    display: grid;
+    gap: 2px;
+  }
+
+  .command-palette-copy strong,
+  .command-palette-copy p {
+    margin: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .command-palette-copy strong {
+    font-size: 12px;
+  }
+
+  .command-palette-copy p {
+    font-size: 11px;
+    color: rgba(221, 231, 239, 0.72);
+  }
+
+  .command-palette-kind {
+    border: 1px solid rgba(127, 165, 198, 0.42);
+    border-radius: 999px;
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    color: rgba(225, 236, 245, 0.85);
+    background: rgba(12, 22, 34, 0.9);
+    flex-shrink: 0;
   }
 
   .voice-toolbar {
@@ -1334,6 +2110,11 @@
   .ghost {
     background: rgba(133, 161, 190, 0.2);
     color: #e5edf4;
+  }
+
+  button.compact {
+    padding: 6px 10px;
+    font-size: 11px;
   }
 
   .primary {

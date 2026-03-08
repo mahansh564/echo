@@ -78,6 +78,10 @@ fn parse_with_rules(input: &str) -> IntentCommand {
         || normalized_without_confirmation.contains("need input")
         || normalized_without_confirmation.contains("input needed")
         || normalized_without_confirmation.contains("pending input")
+        || normalized_without_confirmation.contains("unresolved input")
+        || normalized_without_confirmation.contains("open input")
+        || normalized_without_confirmation.contains("unresolved alert")
+        || normalized_without_confirmation.contains("open alert")
     {
         return IntentCommand {
             action: ACTION_LIST_INPUT_NEEDED.to_string(),
@@ -480,9 +484,12 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_rule_for_start_session() {
-        let intent = parse_intent("http://localhost:9", "start session for agent 2 with opencode")
-            .await
-            .expect("intent");
+        let intent = parse_intent(
+            "http://localhost:9",
+            "start session for agent 2 with opencode",
+        )
+        .await
+        .expect("intent");
         assert_eq!(intent.action, ACTION_START_SESSION);
         assert_eq!(
             intent
@@ -552,5 +559,13 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(false)
         );
+    }
+
+    #[tokio::test]
+    async fn fallback_rule_for_unresolved_inputs_query() {
+        let intent = parse_intent("http://localhost:9", "show unresolved input alerts")
+            .await
+            .expect("intent");
+        assert_eq!(intent.action, ACTION_LIST_INPUT_NEEDED);
     }
 }

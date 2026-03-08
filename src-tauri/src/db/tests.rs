@@ -78,6 +78,51 @@ async fn managed_session_lifecycle_persists() {
 }
 
 #[tokio::test]
+async fn mark_session_stalled_if_not_needs_input_sets_stalled_for_active_session() {
+    let db = setup_test_db().await;
+    let session = db
+        .create_managed_session("opencode", "opencode", "[]", None, None, None, None)
+        .await
+        .unwrap();
+    db.update_session_status(session.id, "active", None)
+        .await
+        .unwrap();
+
+    let marked = db
+        .mark_session_stalled_if_not_needs_input(session.id)
+        .await
+        .unwrap();
+    assert!(marked);
+
+    let stored = db.get_managed_session(session.id).await.unwrap();
+    assert_eq!(stored.status, "stalled");
+    assert!(!stored.needs_input);
+}
+
+#[tokio::test]
+async fn mark_session_stalled_if_not_needs_input_skips_when_needs_input() {
+    let db = setup_test_db().await;
+    let session = db
+        .create_managed_session("opencode", "opencode", "[]", None, None, None, None)
+        .await
+        .unwrap();
+    db.mark_session_needs_input(session.id, "idle_no_output", "Waiting for your input")
+        .await
+        .unwrap();
+
+    let marked = db
+        .mark_session_stalled_if_not_needs_input(session.id)
+        .await
+        .unwrap();
+    assert!(!marked);
+
+    let stored = db.get_managed_session(session.id).await.unwrap();
+    assert_eq!(stored.status, "needs_input");
+    assert!(stored.needs_input);
+    assert_eq!(stored.input_reason.as_deref(), Some("idle_no_output"));
+}
+
+#[tokio::test]
 async fn delete_managed_session_clears_agent_link_and_cascades_rows() {
     let db = setup_test_db().await;
     let agent = db
@@ -225,6 +270,8 @@ async fn session_alert_ack_and_resolve_flow() {
         .unwrap();
     assert!(alert.requires_ack);
     assert!(alert.acknowledged_at.is_none());
+    assert!(alert.snoozed_until.is_none());
+    assert_eq!(alert.escalation_count, 0);
     assert!(alert.resolved_at.is_none());
 
     let unresolved = db
@@ -250,6 +297,218 @@ async fn session_alert_ack_and_resolve_flow() {
     let agents = db.list_agents().await.unwrap();
     let stored_agent = agents.iter().find(|row| row.id == agent.id).unwrap();
     assert_eq!(stored_agent.attention_state, "ok");
+}
+
+#[tokio::test]
+async fn create_session_alert_infers_agent_and_deduplicates_open_alerts() {
+    let db = setup_test_db().await;
+    let agent = db
+        .create_agent("Agent Alert Link", Some("opencode"), None, None)
+        .await
+        .unwrap();
+    let session = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let first = db
+        .create_session_alert(
+            session.id,
+            None,
+            "warning",
+            "tool_confirmation",
+            "Please confirm tool execution",
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.agent_id, Some(agent.id));
+
+    let second = db
+        .create_session_alert(
+            session.id,
+            None,
+            "warning",
+            "tool_confirmation",
+            "Please confirm tool execution",
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.id, first.id);
+    assert_eq!(second.agent_id, Some(agent.id));
+
+    let unresolved = db
+        .list_unresolved_session_alerts(Some(agent.id), Some(20))
+        .await
+        .unwrap();
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0].id, first.id);
+
+    let events = db.list_session_events(session.id, Some(20)).await.unwrap();
+    let persisted_events = events
+        .iter()
+        .filter(|event| event.event_type == "session_alert_upserted")
+        .count();
+    assert_eq!(persisted_events, 2);
+}
+
+#[tokio::test]
+async fn session_alert_snooze_and_escalate_flow() {
+    let db = setup_test_db().await;
+    let agent = db
+        .create_agent("Agent Alert Actions", Some("opencode"), None, None)
+        .await
+        .unwrap();
+    let session = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let alert = db
+        .create_session_alert(
+            session.id,
+            Some(agent.id),
+            "warning",
+            "approval_needed",
+            "Approve deployment",
+            true,
+        )
+        .await
+        .unwrap();
+    let with_alert = db.get_agent(agent.id).await.unwrap();
+    assert_eq!(with_alert.attention_state, "needs_input");
+
+    let snoozed = db.snooze_session_alert(alert.id, 30).await.unwrap();
+    assert!(snoozed.snoozed_until.is_some());
+    let unresolved_after_snooze = db
+        .list_unresolved_session_alerts(Some(agent.id), Some(20))
+        .await
+        .unwrap();
+    assert!(unresolved_after_snooze.is_empty());
+    let after_snooze = db.get_agent(agent.id).await.unwrap();
+    assert_eq!(after_snooze.attention_state, "ok");
+
+    let escalated = db.escalate_session_alert(alert.id).await.unwrap();
+    assert_eq!(escalated.severity, "critical");
+    assert!(escalated.escalated_at.is_some());
+    assert_eq!(escalated.escalation_count, 1);
+    assert!(escalated.snoozed_until.is_none());
+    let unresolved_after_escalate = db
+        .list_unresolved_session_alerts(Some(agent.id), Some(20))
+        .await
+        .unwrap();
+    assert_eq!(unresolved_after_escalate.len(), 1);
+    let after_escalate = db.get_agent(agent.id).await.unwrap();
+    assert_eq!(after_escalate.attention_state, "blocked");
+}
+
+#[tokio::test]
+async fn agent_attention_state_promotes_from_alert_severity() {
+    let db = setup_test_db().await;
+    let agent = db
+        .create_agent("Agent Attention", Some("opencode"), None, None)
+        .await
+        .unwrap();
+    let session = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let warning_alert = db
+        .create_session_alert(
+            session.id,
+            Some(agent.id),
+            "warning",
+            "input_prompt",
+            "Please provide additional context",
+            true,
+        )
+        .await
+        .unwrap();
+    let with_warning = db.get_agent(agent.id).await.unwrap();
+    assert_eq!(with_warning.attention_state, "needs_input");
+
+    let critical_alert = db
+        .create_session_alert(
+            session.id,
+            Some(agent.id),
+            "critical",
+            "auth_needed",
+            "Authentication token expired",
+            true,
+        )
+        .await
+        .unwrap();
+    let with_critical = db.get_agent(agent.id).await.unwrap();
+    assert_eq!(with_critical.attention_state, "blocked");
+
+    let _ = db.resolve_session_alert(critical_alert.id).await.unwrap();
+    let after_critical_resolve = db.get_agent(agent.id).await.unwrap();
+    assert_eq!(after_critical_resolve.attention_state, "needs_input");
+
+    let _ = db.resolve_session_alert(warning_alert.id).await.unwrap();
+    let after_all_resolved = db.get_agent(agent.id).await.unwrap();
+    assert_eq!(after_all_resolved.attention_state, "ok");
+}
+
+#[tokio::test]
+async fn session_needs_input_promotes_attention_state_without_alerts() {
+    let db = setup_test_db().await;
+    let agent = db
+        .create_agent("Agent Session Attention", Some("opencode"), None, None)
+        .await
+        .unwrap();
+    let session = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    db.mark_session_needs_input(
+        session.id,
+        "input_prompt",
+        "Session requires operator confirmation",
+    )
+    .await
+    .unwrap();
+    let while_needed = db.get_agent(agent.id).await.unwrap();
+    assert_eq!(while_needed.attention_state, "needs_input");
+
+    db.clear_session_needs_input(session.id).await.unwrap();
+    let cleared = db.get_agent(agent.id).await.unwrap();
+    assert_eq!(cleared.attention_state, "ok");
 }
 
 #[tokio::test]

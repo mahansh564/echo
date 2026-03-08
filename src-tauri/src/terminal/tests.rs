@@ -1,12 +1,47 @@
 use super::*;
 use crate::db::Db;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+fn shell_path() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+}
+
+fn start_shell_script(manager: &TerminalManager, script: &str) -> Option<TerminalSession> {
+    let shell = shell_path();
+    match manager.start_session_for_test(&shell, &["-lc", script]) {
+        Ok(session) => Some(session),
+        Err(err) => {
+            eprintln!("skipping shell script test: {err}");
+            None
+        }
+    }
+}
+
+fn wait_for_output_contains(
+    manager: &TerminalManager,
+    session_id: i64,
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if manager
+            .session_output(session_id)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
 
 #[test]
 fn pty_spawns() {
     let manager = TerminalManager::new();
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = shell_path();
     let session = match manager.start_session_for_test(&shell, &["-lc", "echo hello"]) {
         Ok(session) => session,
         Err(err) => {
@@ -22,7 +57,7 @@ fn pty_spawns() {
 #[test]
 fn output_chunk_cursor_advances() {
     let manager = TerminalManager::new();
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = shell_path();
     let session = match manager.start_session_for_test(&shell, &["-lc", "printf hello-world"]) {
         Ok(session) => session,
         Err(err) => {
@@ -44,7 +79,7 @@ fn output_chunk_cursor_advances() {
 #[test]
 fn resize_session_succeeds() {
     let manager = TerminalManager::new();
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = shell_path();
     let session = match manager.start_session_for_test(&shell, &["-lc", "echo resize"]) {
         Ok(session) => session,
         Err(err) => {
@@ -55,6 +90,134 @@ fn resize_session_succeeds() {
     manager
         .resize_session(session.id as i64, 100, 32)
         .expect("resize");
+}
+
+#[test]
+fn tui_alt_screen_sequences_are_preserved() {
+    let manager = TerminalManager::new();
+    let Some(session) = start_shell_script(&manager, "printf '\\033[?1049hALT-SCREEN\\033[?1049l'")
+    else {
+        return;
+    };
+
+    assert!(wait_for_output_contains(
+        &manager,
+        session.id as i64,
+        "ALT-SCREEN",
+        Duration::from_secs(2)
+    ));
+
+    let output = manager
+        .session_output(session.id as i64)
+        .unwrap_or_default();
+    assert!(output.contains("\u{1b}[?1049h"));
+    assert!(output.contains("\u{1b}[?1049l"));
+}
+
+#[test]
+fn repl_like_workflow_accepts_incremental_input() {
+    let manager = TerminalManager::new();
+    let Some(session) = start_shell_script(
+        &manager,
+        "printf 'READY\\n'; while IFS= read -r line; do [ \"$line\" = \"exit\" ] && printf 'BYE\\n' && break; printf 'ECHO:%s\\n' \"$line\"; done",
+    ) else {
+        return;
+    };
+
+    let session_id = session.id as i64;
+    assert!(wait_for_output_contains(
+        &manager,
+        session_id,
+        "READY",
+        Duration::from_secs(2)
+    ));
+
+    manager
+        .send_input(session_id, "status\n")
+        .expect("send input");
+    assert!(wait_for_output_contains(
+        &manager,
+        session_id,
+        "ECHO:status",
+        Duration::from_secs(2)
+    ));
+
+    manager.send_input(session_id, "exit\n").expect("send exit");
+    assert!(wait_for_output_contains(
+        &manager,
+        session_id,
+        "BYE",
+        Duration::from_secs(2)
+    ));
+}
+
+#[test]
+fn resize_emits_winch_for_tui_processes() {
+    let manager = TerminalManager::new();
+    let Some(session) = start_shell_script(
+        &manager,
+        "trap 'stty size; exit 0' WINCH; echo WAITING-FOR-WINCH; while :; do sleep 0.1; done",
+    ) else {
+        return;
+    };
+
+    let session_id = session.id as i64;
+    assert!(wait_for_output_contains(
+        &manager,
+        session_id,
+        "WAITING-FOR-WINCH",
+        Duration::from_secs(2)
+    ));
+
+    manager
+        .resize_session(session_id, 120, 40)
+        .expect("resize should send WINCH");
+    assert!(wait_for_output_contains(
+        &manager,
+        session_id,
+        "40 120",
+        Duration::from_secs(2)
+    ));
+}
+
+#[test]
+fn test_runner_like_output_is_retrievable_in_small_chunks() {
+    let manager = TerminalManager::new();
+    let Some(session) = start_shell_script(
+        &manager,
+        "for i in 1 2 3 4 5; do printf 'test_%s ... ok\\n' \"$i\"; sleep 0.03; done; printf 'summary: 5 passed\\n'",
+    ) else {
+        return;
+    };
+
+    let session_id = session.id as i64;
+    assert!(wait_for_output_contains(
+        &manager,
+        session_id,
+        "summary: 5 passed",
+        Duration::from_secs(2)
+    ));
+
+    let mut cursor = 0usize;
+    let mut reconstructed = String::new();
+    for _ in 0..64 {
+        let Some((chunk, next_cursor, has_more)) =
+            manager.session_output_chunk(session_id, cursor, 16)
+        else {
+            break;
+        };
+        if !chunk.is_empty() {
+            reconstructed.push_str(&chunk);
+        }
+        cursor = next_cursor;
+        if !has_more {
+            break;
+        }
+    }
+
+    assert!(reconstructed.contains("test_1 ... ok"));
+    assert!(reconstructed.contains("test_5 ... ok"));
+    assert!(reconstructed.contains("summary: 5 passed"));
 }
 
 #[tokio::test]

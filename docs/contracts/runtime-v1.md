@@ -96,6 +96,8 @@ Severity guidance:
 Alert lifecycle:
 - Created unresolved (`resolved_at = NULL`).
 - May be acknowledged (`acknowledged_at` set) independently of resolution.
+- May be snoozed (`snoozed_until`) to suppress unresolved surfacing until expiry.
+- May be escalated (`severity=critical`, `escalated_at`, incrementing `escalation_count`).
 - Resolved when no longer actionable (`resolved_at` set).
 
 ## 4) Event Naming and Payload Schemas

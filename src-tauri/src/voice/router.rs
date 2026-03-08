@@ -103,10 +103,7 @@ pub async fn execute_command(
                 .or_else(|| {
                     resolved.agent_index_hint.and_then(|index| {
                         resolve_agent_by_index(&locators, index).and_then(|locator| {
-                            agents
-                                .iter()
-                                .find(|agent| agent.id == locator.id)
-                                .cloned()
+                            agents.iter().find(|agent| agent.id == locator.id).cloned()
                         })
                     })
                 })
@@ -276,19 +273,20 @@ pub async fn execute_command(
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
 
-            let session = terminal.start_session(
-                app,
-                db.clone(),
-                StartSessionRequest {
-                    command: command.unwrap_or("opencode").to_string(),
-                    args,
-                    cwd,
-                    agent_id: agent.as_ref().map(|value| value.id),
-                    task_id: agent.as_ref().and_then(|value| value.task_id),
-                    provider: Some("opencode".to_string()),
-                },
-            )
-            .await?;
+            let session = terminal
+                .start_session(
+                    app,
+                    db.clone(),
+                    StartSessionRequest {
+                        command: command.unwrap_or("opencode").to_string(),
+                        args,
+                        cwd,
+                        agent_id: agent.as_ref().map(|value| value.id),
+                        task_id: agent.as_ref().and_then(|value| value.task_id),
+                        provider: Some("opencode".to_string()),
+                    },
+                )
+                .await?;
 
             Ok(serde_json::json!({
                 "type": "session_started",
@@ -486,19 +484,20 @@ pub async fn execute_command(
                 .get("cwd")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
-            let session = terminal.start_session(
-                app,
-                db.clone(),
-                StartSessionRequest {
-                    command: command.unwrap_or("opencode").to_string(),
-                    args,
-                    cwd,
-                    agent_id: agent.as_ref().map(|value| value.id),
-                    task_id: agent.as_ref().and_then(|value| value.task_id),
-                    provider: Some("opencode".to_string()),
-                },
-            )
-            .await?;
+            let session = terminal
+                .start_session(
+                    app,
+                    db.clone(),
+                    StartSessionRequest {
+                        command: command.unwrap_or("opencode").to_string(),
+                        args,
+                        cwd,
+                        agent_id: agent.as_ref().map(|value| value.id),
+                        task_id: agent.as_ref().and_then(|value| value.task_id),
+                        provider: Some("opencode".to_string()),
+                    },
+                )
+                .await?;
             Ok(serde_json::json!({
                 "type": "session_started",
                 "session": session,
@@ -844,7 +843,12 @@ fn extract_agent_name_from_text(text: &str) -> Option<String> {
         if cleaned.is_empty() {
             continue;
         }
-        if cleaned.parse::<i64>().ok().filter(|value| *value > 0).is_some() {
+        if cleaned
+            .parse::<i64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .is_some()
+        {
             return None;
         }
         if nato_alias_to_index(cleaned).is_some() {

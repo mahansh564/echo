@@ -68,6 +68,8 @@ This roadmap assumes a v1 target of up to 10 concurrent active sessions and prio
 - `stop_agent_session_cmd(session_id)`
 - `list_session_alerts_cmd(agent_id?, unresolved_only?)`
 - `acknowledge_session_alert_cmd(alert_id)`
+- `snooze_session_alert_cmd(alert_id, duration_minutes?)`
+- `escalate_session_alert_cmd(alert_id)`
 - `resolve_session_alert_cmd(alert_id)`
 - `send_terminal_input_cmd(session_id, input)`
 - `resize_terminal_cmd(session_id, cols, rows)`
@@ -146,15 +148,15 @@ This roadmap assumes a v1 target of up to 10 concurrent active sessions and prio
 - [x] Replace plain `<pre>` terminal with PTY-capable terminal widget supporting ANSI, alternate screen, resize, and raw input.
 - [x] Stream incremental output chunks with cursoring/backpressure instead of full-buffer polling.
 - [x] Implement attach/detach semantics so an agent session can be interactively controlled in-app.
-- [ ] Add popout terminal path for focused full-screen work while preserving shared session state.
-- [ ] Validate with TUI-heavy workflows (`vim`, `less`, REPLs, test runners).
+- [x] Add popout terminal path for focused full-screen work while preserving shared session state.
+- [x] Validate with TUI-heavy workflows (`vim`, `less`, REPLs, test runners).
 
 ### Phase 6 - Input-Needed Workflow Completion
 
-- [ ] Persist structured alerts and tie them to sessions/agents.
-- [ ] Promote alert state to agent-level `attention_state`.
-- [ ] Provide command palette + voice queries for unresolved inputs.
-- [ ] Add ack/snooze/escalate actions.
+- [x] Persist structured alerts and tie them to sessions/agents.
+- [x] Promote alert state to agent-level `attention_state`.
+- [x] Provide command palette + voice queries for unresolved inputs.
+- [x] Add ack/snooze/escalate actions.
 - [ ] Add optional voice summary loop (example: "2 agents need input").
 
 ### Phase 7 - Reliability, Perf, and Observability

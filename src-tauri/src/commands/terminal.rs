@@ -43,11 +43,12 @@ pub async fn start_agent_session_cmd(
         task_id: None,
     });
 
+    let provider = profile.provider.unwrap_or_else(|| agent.provider.clone());
     let command = profile
         .command
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "opencode".to_string());
+        .unwrap_or_default();
 
     let request = StartSessionRequest {
         command,
@@ -55,7 +56,7 @@ pub async fn start_agent_session_cmd(
         cwd: profile.cwd,
         agent_id: Some(agent_id),
         task_id: profile.task_id.or(agent.task_id),
-        provider: Some(profile.provider.unwrap_or_else(|| agent.provider.clone())),
+        provider: Some(provider),
     };
 
     terminal

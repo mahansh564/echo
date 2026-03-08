@@ -52,6 +52,8 @@ pub fn run() {
             commands::alerts::list_session_alerts_cmd,
             commands::alerts::acknowledge_session_alert_cmd,
             commands::alerts::resolve_session_alert_cmd,
+            commands::alerts::snooze_session_alert_cmd,
+            commands::alerts::escalate_session_alert_cmd,
             commands::agents::create_agent_cmd,
             commands::agents::assign_agent_to_task_cmd,
             commands::agents::list_agents_cmd,
