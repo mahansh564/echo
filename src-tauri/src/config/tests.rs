@@ -13,6 +13,8 @@ fn config_defaults() {
     assert_eq!(config.mic_device, ":1");
     assert_eq!(config.hotkey, "cmd+shift+space");
     assert!(config.voice_enabled);
+    assert!(!config.voice_summary_loop_enabled);
+    assert_eq!(config.voice_summary_loop_interval_sec, 120);
     assert_eq!(config.wake_word_phrase, "echo");
     assert_eq!(config.asr_backend, "sidecar");
     assert_eq!(config.asr_language, "en");
@@ -32,6 +34,8 @@ fn config_merges_user_values() {
 hotkey = "cmd+shift+v"
 model_endpoint = "http://localhost:1234"
 voice_enabled = false
+voice_summary_loop_enabled = true
+voice_summary_loop_interval_sec = 45
 wake_word_phrase = "computer"
 asr_backend = "http"
 asr_sidecar_path = "/tmp/whisper-cli"
@@ -44,6 +48,8 @@ asr_endpoint = "http://localhost:8081/inference"
     assert_eq!(config.hotkey, "cmd+shift+v");
     assert_eq!(config.model_endpoint, "http://localhost:1234");
     assert!(!config.voice_enabled);
+    assert!(config.voice_summary_loop_enabled);
+    assert_eq!(config.voice_summary_loop_interval_sec, 45);
     assert_eq!(config.wake_word_phrase, "computer");
     assert_eq!(config.asr_backend, "http");
     assert_eq!(config.asr_sidecar_path, "/tmp/whisper-cli");

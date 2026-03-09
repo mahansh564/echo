@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod alerts;
 pub mod tasks;
+pub mod telemetry;
 pub mod terminal;
 pub mod voice;
 

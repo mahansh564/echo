@@ -2,16 +2,18 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 use serde_json::Value;
 use tauri::async_runtime::JoinHandle;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{
     config::EchoConfig,
     db::Db,
+    telemetry::Telemetry,
     terminal::TerminalManager,
     voice::{asr, audio, intent, router, tts, wake_word},
 };
@@ -250,9 +252,19 @@ impl VoiceManager {
         config: EchoConfig,
         stop_flag: Arc<AtomicBool>,
     ) {
+        let summary_interval = Duration::from_secs(config.voice_summary_loop_interval_sec.max(15));
+        let mut next_summary_due = Instant::now() + summary_interval;
+
         loop {
             if stop_flag.load(Ordering::SeqCst) {
                 break;
+            }
+
+            if config.voice_summary_loop_enabled && Instant::now() >= next_summary_due {
+                if let Err(err) = self.emit_input_needed_summary_loop(&app, &db).await {
+                    let _ = self.emit_error(&app, format!("voice summary loop failed: {}", err));
+                }
+                next_summary_due = Instant::now() + summary_interval;
             }
 
             let wake_wav = match tauri::async_runtime::spawn_blocking({
@@ -374,6 +386,34 @@ impl VoiceManager {
         }
     }
 
+    async fn emit_input_needed_summary_loop(&self, app: &AppHandle, db: &Db) -> Result<()> {
+        let alerts = db.list_unresolved_session_alerts(None, Some(200)).await?;
+        let agent_count = alerts
+            .iter()
+            .filter_map(|alert| alert.agent_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let alert_count = alerts.len();
+
+        let Some(summary) = build_input_needed_loop_summary(agent_count, alert_count) else {
+            return Ok(());
+        };
+
+        if let Err(err) = tts::speak(&summary) {
+            self.emit_error(app, format!("tts failed: {}", err))?;
+        }
+        app.emit(
+            "voice_status_reply",
+            VoiceStatusReplyEvent {
+                request_type: "input_needed_summary_loop".to_string(),
+                target_agent_id: None,
+                summary,
+                at: now_timestamp(),
+            },
+        )?;
+        Ok(())
+    }
+
     async fn handle_transcript(
         &self,
         app: &AppHandle,
@@ -437,17 +477,26 @@ impl VoiceManager {
                     "ok",
                 );
                 app.emit("voice_action_executed", execution_event)?;
+                record_voice_command_metric(app, &parsed.action, "ok", &parsed.payload, &result);
                 self.set_state(app, VoiceRuntimeState::Listening)?;
                 Ok(result)
             }
             Err(err) => {
+                let error_result = serde_json::json!({ "error": err.to_string() });
                 let execution_event = build_voice_action_executed_event(
                     &parsed.action,
                     &parsed.payload,
-                    &serde_json::json!({ "error": err.to_string() }),
+                    &error_result,
                     "error",
                 );
                 app.emit("voice_action_executed", execution_event)?;
+                record_voice_command_metric(
+                    app,
+                    &parsed.action,
+                    "error",
+                    &parsed.payload,
+                    &error_result,
+                );
                 self.emit_error(app, err.to_string())?;
                 self.set_state(app, VoiceRuntimeState::Listening)?;
                 Err(err)
@@ -557,6 +606,24 @@ fn now_timestamp() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
+fn record_voice_command_metric(
+    app: &AppHandle,
+    action: &str,
+    outcome: &str,
+    payload: &Value,
+    result: &Value,
+) {
+    let telemetry = app.state::<Telemetry>();
+    telemetry.record_voice_command(
+        action,
+        outcome,
+        target_agent_id_from_result(result)
+            .or_else(|| payload.get("agent_id").and_then(|value| value.as_i64())),
+        target_session_id_from_result(result)
+            .or_else(|| payload.get("session_id").and_then(|value| value.as_i64())),
+    );
+}
+
 fn should_emit_status_reply(action: &str, result: &Value) -> bool {
     matches!(
         result.get("type").and_then(|value| value.as_str()),
@@ -613,6 +680,24 @@ fn build_spoken_status_summary(_action: &str, result: &Value) -> Option<String> 
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
     }
+}
+
+fn build_input_needed_loop_summary(agent_count: usize, alert_count: usize) -> Option<String> {
+    if agent_count == 0 {
+        return None;
+    }
+
+    let noun = if agent_count == 1 { "agent" } else { "agents" };
+    let verb = if agent_count == 1 { "needs" } else { "need" };
+    let request_noun = if alert_count == 1 {
+        "request"
+    } else {
+        "requests"
+    };
+    Some(format!(
+        "{} {} {} input across {} unresolved input {}.",
+        agent_count, noun, verb, alert_count, request_noun
+    ))
 }
 
 #[cfg(test)]
@@ -672,5 +757,19 @@ mod tests {
     fn status_reply_detection_uses_result_type() {
         let result = serde_json::json!({ "type": "status_overview" });
         assert!(should_emit_status_reply("attach_agent", &result));
+    }
+
+    #[test]
+    fn input_needed_loop_summary_uses_counts() {
+        let summary = build_input_needed_loop_summary(2, 3).expect("summary");
+        assert_eq!(
+            summary,
+            "2 agents need input across 3 unresolved input requests."
+        );
+    }
+
+    #[test]
+    fn input_needed_loop_summary_skips_when_none_need_input() {
+        assert!(build_input_needed_loop_summary(0, 0).is_none());
     }
 }

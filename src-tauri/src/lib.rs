@@ -1,6 +1,6 @@
 use tauri::Manager;
 
-use crate::{terminal::TerminalManager, voice::VoiceManager};
+use crate::{telemetry::Telemetry, terminal::TerminalManager, voice::VoiceManager};
 
 pub mod commands;
 pub mod config;
@@ -8,6 +8,7 @@ pub mod core;
 pub mod db;
 pub mod linear;
 pub mod providers;
+pub mod telemetry;
 pub mod terminal;
 pub mod voice;
 
@@ -28,6 +29,7 @@ pub fn run() {
             let db_url = format!("sqlite://{}", db_path.display());
             let db = tauri::async_runtime::block_on(db::Db::connect(&db_url))?;
             app.manage(db);
+            app.manage(Telemetry::new());
             let terminal = TerminalManager::new();
             let db_state = app.state::<db::Db>().inner().clone();
             let _ = tauri::async_runtime::block_on(terminal.reconcile_orphan_sessions(&db_state));
@@ -75,6 +77,7 @@ pub fn run() {
             commands::voice::voice_status_cmd,
             commands::voice::process_voice_text_cmd,
             commands::voice::push_to_talk_cmd,
+            commands::telemetry::telemetry_snapshot_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

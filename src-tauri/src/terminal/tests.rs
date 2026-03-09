@@ -241,3 +241,29 @@ async fn reconcile_orphan_sessions_marks_open_rows_failed() {
     let updated = db.get_managed_session(session.id).await.expect("updated");
     assert_eq!(updated.status, "failed");
 }
+
+#[test]
+fn session_output_buffer_trims_to_limit_and_advances_base_cursor() {
+    let mut buffer = SessionOutputBuffer::with_limit(8);
+    assert_eq!(buffer.append("abcd"), 4);
+    assert_eq!(buffer.append("efgh"), 8);
+    assert_eq!(buffer.append("ijkl"), 12);
+
+    assert_eq!(buffer.snapshot(), "efghijkl");
+    let (chunk, next, has_more) = buffer.chunk(0, 8);
+    assert_eq!(chunk, "efghijkl");
+    assert_eq!(next, 12);
+    assert!(!has_more);
+}
+
+#[test]
+fn session_output_buffer_chunk_handles_cursor_before_trimmed_window() {
+    let mut buffer = SessionOutputBuffer::with_limit(10);
+    let _ = buffer.append("0123456789");
+    let _ = buffer.append("abcdef");
+
+    let (chunk, next, has_more) = buffer.chunk(2, 4);
+    assert_eq!(chunk, "6789");
+    assert_eq!(next, 10);
+    assert!(has_more);
+}

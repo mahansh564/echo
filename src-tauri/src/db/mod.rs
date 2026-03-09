@@ -879,6 +879,23 @@ impl Db {
         Ok(alert)
     }
 
+    pub async fn alert_resolution_latency_ms(&self, alert_id: i64) -> Result<Option<i64>> {
+        let latency = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT
+                CASE
+                    WHEN resolved_at IS NULL THEN NULL
+                    ELSE CAST((julianday(resolved_at) - julianday(created_at)) * 86400000 AS INTEGER)
+                END
+             FROM session_alerts
+             WHERE id = ?",
+        )
+        .bind(alert_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        Ok(latency)
+    }
+
     pub async fn list_session_events(
         &self,
         session_id: i64,

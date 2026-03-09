@@ -9,10 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::db::{models::ManagedSession, models::StartSessionRequest, Db};
 use crate::providers::{adapter_for, ProviderParseState, ProviderStructuredEvent};
+use crate::telemetry::Telemetry;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const STALE_THRESHOLD: Duration = Duration::from_secs(20);
@@ -21,6 +22,10 @@ const OPENCODE_IDLE_INPUT_THRESHOLD: Duration = Duration::from_secs(2);
 const OPENCODE_IDLE_INPUT_REASON: &str = "idle_no_output";
 const OPENCODE_IDLE_INPUT_MESSAGE: &str = "Waiting for your input";
 const IDLE_INPUT_MONITOR_INTERVAL: Duration = Duration::from_millis(250);
+const PER_SESSION_OUTPUT_MAX_BYTES: usize = 200_000;
+const TARGET_ACTIVE_SESSION_CAPACITY: usize = 10;
+const TOTAL_OUTPUT_MEMORY_CAP_BYTES: usize =
+    PER_SESSION_OUTPUT_MAX_BYTES * TARGET_ACTIVE_SESSION_CAPACITY;
 
 fn apply_terminal_env(cmd: &mut CommandBuilder) {
     // Full-screen TUIs break badly with TERM=dumb (partial renders, no alt-screen semantics).
@@ -103,12 +108,82 @@ struct SessionAlertCreatedEvent {
 
 struct SessionHandle {
     last_snippet: Arc<Mutex<String>>,
-    output: Arc<Mutex<String>>,
+    output: Arc<Mutex<SessionOutputBuffer>>,
     master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     idle_input_marked: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
+}
+
+#[derive(Clone)]
+struct SessionOutputBuffer {
+    base_offset: usize,
+    data: String,
+    max_bytes: usize,
+}
+
+impl SessionOutputBuffer {
+    fn with_limit(max_bytes: usize) -> Self {
+        Self {
+            base_offset: 0,
+            data: String::new(),
+            max_bytes: max_bytes.max(1),
+        }
+    }
+
+    fn append(&mut self, chunk: &str) -> usize {
+        self.data.push_str(chunk);
+        self.trim_to_limit();
+        self.end_cursor()
+    }
+
+    fn snapshot(&self) -> String {
+        self.data.clone()
+    }
+
+    fn chunk(&self, cursor: usize, max_bytes: usize) -> (String, usize, bool) {
+        let start_abs = cursor.max(self.base_offset);
+        let end_abs = self.end_cursor();
+        if start_abs >= end_abs {
+            return (String::new(), end_abs, false);
+        }
+
+        let start_idx = start_abs - self.base_offset;
+        let requested_end = start_idx
+            .saturating_add(max_bytes.max(1))
+            .min(self.data.len());
+        let mut end_idx = clamp_to_char_boundary(&self.data, requested_end);
+        if end_idx <= start_idx {
+            end_idx = next_char_boundary(&self.data, start_idx);
+        }
+
+        let chunk = self.data[start_idx..end_idx].to_string();
+        let next_cursor = self.base_offset + end_idx;
+        let has_more = next_cursor < end_abs;
+        (chunk, next_cursor, has_more)
+    }
+
+    fn end_cursor(&self) -> usize {
+        self.base_offset + self.data.len()
+    }
+
+    fn trim_to_limit(&mut self) {
+        if self.data.len() <= self.max_bytes {
+            return;
+        }
+
+        let overflow = self.data.len() - self.max_bytes;
+        let mut trim_at = overflow.min(self.data.len());
+        while trim_at < self.data.len() && !self.data.is_char_boundary(trim_at) {
+            trim_at += 1;
+        }
+        if trim_at == 0 {
+            return;
+        }
+        self.data.drain(..trim_at);
+        self.base_offset += trim_at;
+    }
 }
 
 impl TerminalManager {
@@ -230,6 +305,10 @@ impl TerminalManager {
         let id = self.next_legacy_id.fetch_add(1, Ordering::SeqCst);
         let last_snippet = Arc::new(Mutex::new(String::new()));
         let snippet_clone = Arc::clone(&last_snippet);
+        let output = Arc::new(Mutex::new(SessionOutputBuffer::with_limit(
+            PER_SESSION_OUTPUT_MAX_BYTES,
+        )));
+        let output_clone = Arc::clone(&output);
 
         thread::spawn(move || {
             let mut buf = [0u8; 1024];
@@ -238,8 +317,12 @@ impl TerminalManager {
                     Ok(0) => break,
                     Ok(n) => {
                         let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                        let mut stored = snippet_clone.lock().unwrap();
-                        *stored = text;
+                        {
+                            let mut stored = snippet_clone.lock().unwrap();
+                            *stored = text.clone();
+                        }
+                        let mut out = output_clone.lock().unwrap();
+                        out.append(&text);
                     }
                     Err(_) => break,
                 }
@@ -248,7 +331,7 @@ impl TerminalManager {
 
         let handle = SessionHandle {
             last_snippet,
-            output: Arc::new(Mutex::new(String::new())),
+            output,
             master: Mutex::new(master),
             writer: Mutex::new(writer),
             idle_input_marked: Arc::new(AtomicBool::new(false)),
@@ -320,13 +403,35 @@ impl SessionSupervisor {
             .clone()
             .unwrap_or_else(|| "opencode".to_string());
         let adapter = adapter_for(&requested_provider);
-        let spawn_spec = adapter.spawn_session(&request)?;
+        let spawn_spec = match adapter.spawn_session(&request) {
+            Ok(spec) => spec,
+            Err(err) => {
+                record_session_start_failed_metric(
+                    app,
+                    None,
+                    request.agent_id,
+                    adapter.provider_name(),
+                    "supervisor.spawn_spec",
+                    &err.to_string(),
+                );
+                return Err(err);
+            }
+        };
         if spawn_spec.command.trim().is_empty() {
-            return Err(anyhow!("command is required"));
+            let err = anyhow!("command is required");
+            record_session_start_failed_metric(
+                app,
+                None,
+                request.agent_id,
+                adapter.provider_name(),
+                "supervisor.spawn_spec",
+                &err.to_string(),
+            );
+            return Err(err);
         }
 
         let args_json = serde_json::to_string(&spawn_spec.args)?;
-        let managed = db
+        let managed = match db
             .create_managed_session(
                 adapter.provider_name(),
                 &spawn_spec.command,
@@ -336,7 +441,21 @@ impl SessionSupervisor {
                 request.task_id,
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(managed) => managed,
+            Err(err) => {
+                record_session_start_failed_metric(
+                    app,
+                    None,
+                    request.agent_id,
+                    adapter.provider_name(),
+                    "supervisor.create_session_row",
+                    &err.to_string(),
+                );
+                return Err(err);
+            }
+        };
 
         let pty_system = native_pty_system();
         let pair = match pty_system.openpty(PtySize {
@@ -359,6 +478,14 @@ impl SessionSupervisor {
                     )
                     .await;
                 emit_runtime_events(app, &db, managed.id).await;
+                record_session_start_failed_metric(
+                    app,
+                    Some(managed.id),
+                    request.agent_id,
+                    adapter.provider_name(),
+                    "supervisor.open_pty",
+                    &err.to_string(),
+                );
                 return Err(err.into());
             }
         };
@@ -393,6 +520,14 @@ impl SessionSupervisor {
                     )
                     .await;
                 emit_runtime_events(app, &db, managed.id).await;
+                record_session_start_failed_metric(
+                    app,
+                    Some(managed.id),
+                    request.agent_id,
+                    adapter.provider_name(),
+                    "supervisor.spawn_command",
+                    &err.to_string(),
+                );
                 return Err(err.into());
             }
         };
@@ -425,7 +560,13 @@ impl SessionSupervisor {
         let mut reader = master.try_clone_reader()?;
         let writer = master.take_writer()?;
         let last_snippet = Arc::new(Mutex::new(String::new()));
-        let output = Arc::new(Mutex::new(String::new()));
+        debug_assert!(
+            TOTAL_OUTPUT_MEMORY_CAP_BYTES
+                >= PER_SESSION_OUTPUT_MAX_BYTES * TARGET_ACTIVE_SESSION_CAPACITY
+        );
+        let output = Arc::new(Mutex::new(SessionOutputBuffer::with_limit(
+            PER_SESSION_OUTPUT_MAX_BYTES,
+        )));
         let last_heartbeat = Arc::new(Mutex::new(Instant::now()));
         let stalled_reported = Arc::new(AtomicBool::new(false));
         let idle_input_marked = Arc::new(AtomicBool::new(false));
@@ -474,12 +615,7 @@ impl SessionSupervisor {
                         }
                         let cursor = {
                             let mut out = output_for_reader.lock().unwrap();
-                            out.push_str(&snippet);
-                            if out.len() > 500_000 {
-                                let trim_at = out.len() - 500_000;
-                                out.drain(..trim_at);
-                            }
-                            out.len()
+                            out.append(&snippet)
                         };
                         {
                             let mut hb = hb_for_reader.lock().unwrap();
@@ -611,6 +747,13 @@ impl SessionSupervisor {
                     let _ = db_write
                         .insert_session_event(session_id, "ended", Some("session ended"), None)
                         .await;
+                    record_session_ended_metric(
+                        &app_write,
+                        session_id,
+                        agent_id,
+                        "process_exit",
+                        "supervisor.reader",
+                    );
                     emit_runtime_events(&app_write, &db_write, session_id).await;
                 });
             }
@@ -688,6 +831,13 @@ impl SessionSupervisor {
         });
 
         let latest = db.get_managed_session(managed.id).await?;
+        record_session_started_metric(
+            app,
+            latest.id,
+            latest.agent_id,
+            &latest.provider,
+            "supervisor.start_session",
+        );
         Ok(latest)
     }
 
@@ -733,7 +883,7 @@ impl SessionSupervisor {
         let sessions = self.sessions.lock().unwrap();
         let output = Arc::clone(&sessions.get(&session_id)?.output);
         drop(sessions);
-        let text = output.lock().unwrap().clone();
+        let text = output.lock().unwrap().snapshot();
         Some(text)
     }
 
@@ -746,18 +896,8 @@ impl SessionSupervisor {
         let sessions = self.sessions.lock().unwrap();
         let output = Arc::clone(&sessions.get(&session_id)?.output);
         drop(sessions);
-        let text = output.lock().unwrap().clone();
-
-        let clamped_cursor = clamp_to_char_boundary(&text, cursor.min(text.len()));
-        if clamped_cursor >= text.len() {
-            return Some((String::new(), text.len(), false));
-        }
-
-        let requested_end = clamped_cursor.saturating_add(max_bytes.max(1));
-        let end = clamp_to_char_boundary(&text, requested_end.min(text.len()));
-        let chunk = text[clamped_cursor..end].to_string();
-        let has_more = end < text.len();
-        Some((chunk, end, has_more))
+        let chunk = output.lock().unwrap().chunk(cursor, max_bytes);
+        Some(chunk)
     }
 
     pub fn send_input(&self, session_id: i64, input: &str) -> Result<()> {
@@ -943,6 +1083,17 @@ fn clamp_to_char_boundary(text: &str, idx: usize) -> usize {
     i
 }
 
+fn next_char_boundary(text: &str, idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    let mut i = idx + 1;
+    while i < text.len() && !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i.min(text.len())
+}
+
 async fn emit_runtime_events(app: &AppHandle, db: &Db, session_id: i64) {
     if let Ok(session) = db.get_managed_session(session_id).await {
         if let Some(agent_id) = session.agent_id {
@@ -981,6 +1132,40 @@ fn now_timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+fn record_session_started_metric(
+    app: &AppHandle,
+    session_id: i64,
+    agent_id: Option<i64>,
+    provider: &str,
+    source: &str,
+) {
+    let telemetry = app.state::<Telemetry>();
+    telemetry.record_session_started(session_id, agent_id, provider, source);
+}
+
+fn record_session_start_failed_metric(
+    app: &AppHandle,
+    session_id: Option<i64>,
+    agent_id: Option<i64>,
+    provider: &str,
+    source: &str,
+    reason: &str,
+) {
+    let telemetry = app.state::<Telemetry>();
+    telemetry.record_session_start_failed(session_id, agent_id, provider, source, reason);
+}
+
+fn record_session_ended_metric(
+    app: &AppHandle,
+    session_id: i64,
+    agent_id: Option<i64>,
+    reason: &str,
+    source: &str,
+) {
+    let telemetry = app.state::<Telemetry>();
+    telemetry.record_session_ended(session_id, agent_id, reason, source);
 }
 
 #[cfg(test)]

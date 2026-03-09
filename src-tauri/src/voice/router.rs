@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 use serde_json::Value;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{
     commands,
@@ -9,6 +9,7 @@ use crate::{
         models::{Agent, ManagedSession, SessionStatusSummary, StartSessionRequest},
         Db,
     },
+    telemetry::Telemetry,
     terminal::TerminalManager,
     voice::{resolver, IntentCommand},
 };
@@ -311,7 +312,20 @@ pub async fn execute_command(
             };
             let session = find_session_from_payload(&sessions, &intent.payload, agent.as_ref())
                 .ok_or_else(|| anyhow!("stop_session requires an active target session"))?;
-            terminal.stop_session(db.clone(), session.id)?;
+            let telemetry = app.state::<Telemetry>();
+            if let Err(err) = terminal.stop_session(db.clone(), session.id) {
+                telemetry.record_session_stop_failed(
+                    session.id,
+                    "voice_router.stop_session",
+                    &err.to_string(),
+                );
+                return Err(err);
+            }
+            telemetry.record_session_user_stop(
+                session.id,
+                session.agent_id.or(agent.as_ref().map(|value| value.id)),
+                "voice_router.stop_session",
+            );
             Ok(serde_json::json!({
                 "type": "session_stopped",
                 "sessionId": session.id,

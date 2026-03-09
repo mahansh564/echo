@@ -1,5 +1,6 @@
 use crate::db::models::{ManagedSession, SessionEvent, StartSessionRequest};
 use crate::db::Db;
+use crate::telemetry::Telemetry;
 use crate::terminal::TerminalManager;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -69,23 +70,52 @@ pub async fn start_agent_session_cmd(
 pub async fn stop_agent_session_cmd(
     terminal: tauri::State<'_, TerminalManager>,
     db: tauri::State<'_, Db>,
+    telemetry: tauri::State<'_, Telemetry>,
     session_id: i64,
 ) -> Result<(), String> {
-    terminal
-        .stop_session(db.inner().clone(), session_id)
-        .map_err(|e| e.to_string())
+    let agent_id = db
+        .get_managed_session(session_id)
+        .await
+        .ok()
+        .and_then(|session| session.agent_id);
+    match terminal.stop_session(db.inner().clone(), session_id) {
+        Ok(()) => {
+            telemetry.record_session_user_stop(session_id, agent_id, "stop_agent_session_cmd");
+            Ok(())
+        }
+        Err(err) => {
+            telemetry.record_session_stop_failed(
+                session_id,
+                "stop_agent_session_cmd",
+                &err.to_string(),
+            );
+            Err(err.to_string())
+        }
+    }
 }
 
 #[tauri::command]
 pub async fn delete_managed_session_cmd(
     terminal: tauri::State<'_, TerminalManager>,
     db: tauri::State<'_, Db>,
+    telemetry: tauri::State<'_, Telemetry>,
     session_id: i64,
 ) -> Result<(), String> {
+    let agent_id = db
+        .get_managed_session(session_id)
+        .await
+        .ok()
+        .and_then(|session| session.agent_id);
     if terminal.has_session(session_id) {
-        terminal
-            .stop_session(db.inner().clone(), session_id)
-            .map_err(|e| e.to_string())?;
+        if let Err(err) = terminal.stop_session(db.inner().clone(), session_id) {
+            telemetry.record_session_stop_failed(
+                session_id,
+                "delete_managed_session_cmd",
+                &err.to_string(),
+            );
+            return Err(err.to_string());
+        }
+        telemetry.record_session_user_stop(session_id, agent_id, "delete_managed_session_cmd");
     }
     db.delete_managed_session(session_id)
         .await

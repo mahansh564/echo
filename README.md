@@ -18,7 +18,7 @@ This roadmap assumes a v1 target of up to 10 concurrent active sessions and prio
 - Svelte UI already shows agents, sessions, and a basic terminal output/input panel.
 - Main gap is productization: richer runtime model, robust eventing, structured input-needed detection, real terminal attach UX, and command-quality voice controls.
 
-## Implementation Status (As Of 2026-03-04)
+## Implementation Status (As Of 2026-03-09)
 
 - Phase 1 is in progress and substantially implemented.
 - Phase 0 contract freeze artifacts are now documented in `docs/contracts/runtime-v1.md`.
@@ -33,6 +33,11 @@ This roadmap assumes a v1 target of up to 10 concurrent active sessions and prio
   - Wired frontend to use `list_agent_rows_cmd` and unresolved alerts.
   - Added alert actions in UI (acknowledge/resolve) and terminal focus from alert.
   - Added migration compatibility test for legacy DB upgrade on `Db::connect`.
+  - Added telemetry layer with structured JSON logs and in-memory metrics for:
+    - session churn (starts, failures, user stops, process exits)
+    - alert resolution latency
+    - voice command success/error outcomes
+  - Added `telemetry_snapshot_cmd` to expose runtime telemetry counters.
   - `npm run check` and `cargo test` are currently passing.
 - Still pending in Phase 1:
   - None from the original Phase 1 checklist; rollback strategy documented in `docs/operations/migrations/`.
@@ -157,12 +162,12 @@ This roadmap assumes a v1 target of up to 10 concurrent active sessions and prio
 - [x] Promote alert state to agent-level `attention_state`.
 - [x] Provide command palette + voice queries for unresolved inputs.
 - [x] Add ack/snooze/escalate actions.
-- [ ] Add optional voice summary loop (example: "2 agents need input").
+- [x] Add optional voice summary loop (example: "2 agents need input").
 
 ### Phase 7 - Reliability, Perf, and Observability
 
-- [ ] Add per-session ring buffer limits and memory caps for 10 active sessions.
-- [ ] Add structured logs and metrics for session churn, alert latency, and voice command success.
+- [x] Add per-session ring buffer limits and memory caps for 10 active sessions.
+- [x] Add structured logs and metrics for session churn, alert latency, and voice command success.
 - [ ] Add reconnect/reload behavior for UI listeners and terminal stream cursors.
 - [ ] Add robust error surfaces in UI (adapter down, model down, mic unavailable).
 - [ ] Hardening pass for race conditions around stop/restart/attach.

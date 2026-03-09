@@ -1,6 +1,7 @@
 use crate::commands::emit_agent_updated;
 use crate::db::models::SessionAlert;
 use crate::db::Db;
+use crate::telemetry::Telemetry;
 use serde::Serialize;
 use tauri::Emitter;
 
@@ -95,11 +96,18 @@ pub async fn acknowledge_session_alert_cmd(
 pub async fn resolve_session_alert_cmd(
     app: tauri::AppHandle,
     db: tauri::State<'_, Db>,
+    telemetry: tauri::State<'_, Telemetry>,
     alert_id: i64,
 ) -> Result<SessionAlert, String> {
     let alert = resolve_session_alert(&db, alert_id)
         .await
         .map_err(|e| e.to_string())?;
+    let latency_ms = db
+        .alert_resolution_latency_ms(alert.id)
+        .await
+        .ok()
+        .flatten();
+    telemetry.record_alert_resolved(alert.id, alert.session_id, alert.agent_id, latency_ms);
     if let Some(agent_id) = alert.agent_id {
         let _ = emit_agent_updated(&app, agent_id);
     }

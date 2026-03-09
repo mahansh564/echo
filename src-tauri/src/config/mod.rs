@@ -8,6 +8,8 @@ pub struct EchoConfig {
     pub hotkey: String,
     pub model_endpoint: String,
     pub voice_enabled: bool,
+    pub voice_summary_loop_enabled: bool,
+    pub voice_summary_loop_interval_sec: u64,
     pub wake_word_model_path: String,
     pub wake_word_phrase: String,
     pub wake_word_sensitivity: f32,
@@ -28,6 +30,8 @@ struct PartialConfig {
     pub hotkey: Option<String>,
     pub model_endpoint: Option<String>,
     pub voice_enabled: Option<bool>,
+    pub voice_summary_loop_enabled: Option<bool>,
+    pub voice_summary_loop_interval_sec: Option<u64>,
     pub wake_word_model_path: Option<String>,
     pub wake_word_phrase: Option<String>,
     pub wake_word_sensitivity: Option<f32>,
@@ -50,6 +54,8 @@ impl Default for EchoConfig {
             hotkey: "cmd+shift+space".to_string(),
             model_endpoint: "http://localhost:11434".to_string(),
             voice_enabled: true,
+            voice_summary_loop_enabled: false,
+            voice_summary_loop_interval_sec: 120,
             wake_word_model_path: format!("{}/.echo/wake_words/echo.rpw", home),
             wake_word_phrase: "echo".to_string(),
             wake_word_sensitivity: 0.5,
@@ -83,6 +89,12 @@ pub fn load_config() -> Result<EchoConfig> {
             }
             if let Some(value) = partial.voice_enabled {
                 config.voice_enabled = value;
+            }
+            if let Some(value) = partial.voice_summary_loop_enabled {
+                config.voice_summary_loop_enabled = value;
+            }
+            if let Some(value) = partial.voice_summary_loop_interval_sec {
+                config.voice_summary_loop_interval_sec = value.max(15);
             }
             if let Some(value) = partial.wake_word_model_path {
                 config.wake_word_model_path = value;

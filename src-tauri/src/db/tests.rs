@@ -287,6 +287,9 @@ async fn session_alert_ack_and_resolve_flow() {
 
     let resolved = db.resolve_session_alert(alert.id).await.unwrap();
     assert!(resolved.resolved_at.is_some());
+    let latency_ms = db.alert_resolution_latency_ms(alert.id).await.unwrap();
+    assert!(latency_ms.is_some());
+    assert!(latency_ms.unwrap_or_default() >= 0);
 
     let unresolved_after = db
         .list_unresolved_session_alerts(Some(agent.id), Some(10))
