@@ -168,8 +168,8 @@ This roadmap assumes a v1 target of up to 10 concurrent active sessions and prio
 
 - [x] Add per-session ring buffer limits and memory caps for 10 active sessions.
 - [x] Add structured logs and metrics for session churn, alert latency, and voice command success.
-- [ ] Add reconnect/reload behavior for UI listeners and terminal stream cursors.
-- [ ] Add robust error surfaces in UI (adapter down, model down, mic unavailable).
+- [x] Add reconnect/reload behavior for UI listeners and terminal stream cursors.
+- [x] Add robust error surfaces in UI (adapter down, model down, mic unavailable).
 - [ ] Hardening pass for race conditions around stop/restart/attach.
 
 ### Phase 8 - Verification and Release

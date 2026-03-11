@@ -128,6 +128,22 @@
     at: string;
   };
 
+  type RuntimeIssueKind = "adapter_down" | "model_down" | "mic_unavailable";
+
+  type RuntimeIssueSeverity = "warning" | "critical";
+
+  type RuntimeIssue = {
+    kind: RuntimeIssueKind;
+    severity: RuntimeIssueSeverity;
+    title: string;
+    guidance: string;
+    message: string;
+    source: "voice" | "terminal" | "session_alert" | "system";
+    firstSeenAt: number;
+    lastSeenAt: number;
+    count: number;
+  };
+
   type SessionAlert = {
     id: number;
     sessionId: number;
@@ -175,6 +191,8 @@
     chunk: string;
     cursor: number;
   };
+
+  type UnlistenFn = () => void;
 
   type AgentListItem = {
     agent: AgentRow;
@@ -247,11 +265,17 @@
   let unresolvedAlertsLoading = $state<boolean>(false);
   let alertActionBusyId = $state<number | null>(null);
   let alertToasts = $state<AlertToast[]>([]);
+  let runtimeIssues = $state<RuntimeIssue[]>([]);
 
   let terminalWidget: Terminal | null = null;
   let fitAddon: FitAddon | null = null;
   let terminalDataListener: { dispose: () => void } | null = null;
   let terminalFlushRaf = 0;
+  let terminalCursorPersistTimer = 0;
+  let listenerReconnectTimer = 0;
+  let listenerReconnectAttempts = 0;
+  let listenerLifecycleStopped = false;
+  let uiUnlisteners: UnlistenFn[] = [];
 
   const terminalViewportState: TerminalViewportState = {
     selectedSessionId: null,
@@ -267,8 +291,72 @@
   const TERMINAL_FRAME_WRITE_BUDGET_BYTES = 32_768;
   const TERMINAL_MAX_PENDING_CHUNKS = 512;
   const TERMINAL_POPOUT_WINDOW_LABEL = "terminal-popout";
+  const TERMINAL_CURSOR_STORAGE_KEY = "echo.main.terminal-cursors.v1";
+  const SELECTED_SESSION_STORAGE_KEY = "echo.main.selected-session.v1";
+  const TERMINAL_CURSOR_PERSIST_DEBOUNCE_MS = 250;
+  const LISTENER_RECONNECT_BASE_MS = 1000;
+  const LISTENER_RECONNECT_MAX_MS = 15000;
   const ALERT_TOAST_MAX = 4;
   const ALERT_TOAST_TTL_MS = 8000;
+  const RUNTIME_ISSUE_MAX = 6;
+  const RUNTIME_ISSUE_MIC_PATTERNS = [
+    "microphone",
+    "audio device",
+    "avfoundation",
+    "ffmpeg capture failed",
+    "permission",
+    "input device",
+    "device not found"
+  ];
+  const RUNTIME_ISSUE_MODEL_PATTERNS = [
+    "asr model",
+    "asr sidecar",
+    "asr endpoint",
+    "model endpoint",
+    "/api/generate",
+    "transcribe",
+    "error sending request",
+    "connection refused",
+    "timed out",
+    "dns",
+    "reqwest",
+    "llama"
+  ];
+  const RUNTIME_ISSUE_ADAPTER_PATTERNS = [
+    "failed to spawn command",
+    "command is required",
+    "failed to open pty",
+    "provider parse error",
+    "adapter parse error",
+    "spawn command",
+    "no such file or directory",
+    "session start failed"
+  ];
+
+  const RUNTIME_ISSUE_META: Record<
+    RuntimeIssueKind,
+    {
+      title: string;
+      guidance: string;
+      severity: RuntimeIssueSeverity;
+    }
+  > = {
+    adapter_down: {
+      title: "Adapter unavailable",
+      guidance: "Verify the provider CLI is installed and runnable from this machine.",
+      severity: "critical"
+    },
+    model_down: {
+      title: "Model unavailable",
+      guidance: "Check ASR/LLM endpoint reachability and local model/sidecar paths.",
+      severity: "warning"
+    },
+    mic_unavailable: {
+      title: "Microphone unavailable",
+      guidance: "Confirm microphone permissions and selected audio input device.",
+      severity: "critical"
+    }
+  };
 
   const alertToastTimers = new Map<string, number>();
 
@@ -335,6 +423,15 @@
     agentListItems.filter((item) => showClosedAgents || item.isRunning)
   );
 
+  const activeRuntimeIssues = $derived(
+    [...runtimeIssues].sort((left, right) => {
+      if (left.severity !== right.severity) {
+        return left.severity === "critical" ? -1 : 1;
+      }
+      return right.lastSeenAt - left.lastSeenAt;
+    })
+  );
+
   const toTitleCase = (value: string) =>
     value
       .split(/[_\s-]+/)
@@ -365,6 +462,173 @@
       lastInputRequiredAt: formatRelativeTime(agent.lastInputRequiredAt ?? null)
     }));
   };
+
+  const parsePositiveSessionId = (value: unknown) => {
+    if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+      return null;
+    }
+    return value;
+  };
+
+  const includesAnyPattern = (value: string, patterns: string[]) =>
+    patterns.some((pattern) => value.includes(pattern));
+
+  const normalizeErrorMessage = (error: unknown) => {
+    if (typeof error === "string") return error;
+    if (error && typeof error === "object" && "message" in error) {
+      const maybeMessage = (error as { message?: unknown }).message;
+      if (typeof maybeMessage === "string") return maybeMessage;
+    }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  };
+
+  const classifyRuntimeIssue = (
+    message: string,
+    forcedKind?: RuntimeIssueKind
+  ): RuntimeIssueKind | null => {
+    if (forcedKind) return forcedKind;
+    const normalized = message.toLowerCase();
+    if (includesAnyPattern(normalized, RUNTIME_ISSUE_MIC_PATTERNS)) {
+      return "mic_unavailable";
+    }
+    if (includesAnyPattern(normalized, RUNTIME_ISSUE_MODEL_PATTERNS)) {
+      return "model_down";
+    }
+    if (includesAnyPattern(normalized, RUNTIME_ISSUE_ADAPTER_PATTERNS)) {
+      return "adapter_down";
+    }
+    return null;
+  };
+
+  function clearRuntimeIssue(kind: RuntimeIssueKind) {
+    runtimeIssues = runtimeIssues.filter((issue) => issue.kind !== kind);
+  }
+
+  function dismissRuntimeIssue(kind: RuntimeIssueKind) {
+    clearRuntimeIssue(kind);
+  }
+
+  function reportRuntimeIssue(input: {
+    error: unknown;
+    source: RuntimeIssue["source"];
+    forcedKind?: RuntimeIssueKind;
+  }) {
+    const message = normalizeErrorMessage(input.error).trim();
+    if (!message) return;
+    const kind = classifyRuntimeIssue(message, input.forcedKind);
+    if (!kind) return;
+
+    const meta = RUNTIME_ISSUE_META[kind];
+    const now = Date.now();
+    const existing = runtimeIssues.find((issue) => issue.kind === kind);
+    if (existing) {
+      runtimeIssues = runtimeIssues.map((issue) =>
+        issue.kind === kind
+          ? {
+              ...issue,
+              message,
+              source: input.source,
+              lastSeenAt: now,
+              count: issue.count + 1
+            }
+          : issue
+      );
+      return;
+    }
+
+    const next: RuntimeIssue = {
+      kind,
+      severity: meta.severity,
+      title: meta.title,
+      guidance: meta.guidance,
+      message,
+      source: input.source,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      count: 1
+    };
+    runtimeIssues = [next, ...runtimeIssues].slice(0, RUNTIME_ISSUE_MAX);
+  }
+
+  function restoreTerminalViewportState() {
+    if (typeof window === "undefined") return;
+
+    const storedSelectedSession = window.sessionStorage.getItem(SELECTED_SESSION_STORAGE_KEY);
+    if (storedSelectedSession) {
+      const parsed = Number.parseInt(storedSelectedSession, 10);
+      const sessionId = parsePositiveSessionId(parsed);
+      if (sessionId) {
+        selectedSessionId = sessionId;
+      }
+    }
+
+    const rawCursorState = window.sessionStorage.getItem(TERMINAL_CURSOR_STORAGE_KEY);
+    if (!rawCursorState) return;
+    try {
+      const parsed = JSON.parse(rawCursorState) as Record<string, unknown>;
+      for (const [key, value] of Object.entries(parsed)) {
+        const sessionId = parsePositiveSessionId(Number.parseInt(key, 10));
+        if (!sessionId) continue;
+        const cursor =
+          typeof value === "number" && Number.isFinite(value) && value >= 0
+            ? Math.floor(value)
+            : null;
+        if (cursor === null) continue;
+        terminalCursorBySession.set(sessionId, cursor);
+      }
+    } catch (error) {
+      console.error("Failed to restore terminal cursor state", error);
+    }
+  }
+
+  function persistSelectedSession(sessionId: number | null) {
+    if (typeof window === "undefined") return;
+    if (!sessionId) {
+      window.sessionStorage.removeItem(SELECTED_SESSION_STORAGE_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(SELECTED_SESSION_STORAGE_KEY, String(sessionId));
+  }
+
+  function persistTerminalCursors() {
+    if (typeof window === "undefined") return;
+    const cursorState: Record<string, number> = {};
+    for (const [sessionId, cursor] of terminalCursorBySession.entries()) {
+      if (!Number.isFinite(cursor) || cursor < 0) continue;
+      cursorState[String(sessionId)] = Math.floor(cursor);
+    }
+    if (Object.keys(cursorState).length === 0) {
+      window.sessionStorage.removeItem(TERMINAL_CURSOR_STORAGE_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify(cursorState));
+  }
+
+  function schedulePersistTerminalCursors() {
+    if (typeof window === "undefined") return;
+    if (terminalCursorPersistTimer) return;
+    terminalCursorPersistTimer = window.setTimeout(() => {
+      terminalCursorPersistTimer = 0;
+      persistTerminalCursors();
+    }, TERMINAL_CURSOR_PERSIST_DEBOUNCE_MS);
+  }
+
+  const listenerReconnectDelayMs = (attempt: number) =>
+    Math.min(
+      LISTENER_RECONNECT_MAX_MS,
+      LISTENER_RECONNECT_BASE_MS * Math.pow(2, Math.max(0, attempt - 1))
+    );
+
+  function clearUiListeners() {
+    for (const unlisten of uiUnlisteners) {
+      unlisten();
+    }
+    uiUnlisteners = [];
+  }
 
   async function loadData(options: { background?: boolean } = {}) {
     const background = options.background ?? hasLoadedOnce;
@@ -424,7 +688,13 @@
       }
 
       if (nextSessionId !== selectedSessionId) {
-        await setSelectedSession(nextSessionId, { reset: true });
+        await setSelectedSession(nextSessionId, {
+          reset: nextSessionId !== null ? !terminalCursorBySession.has(nextSessionId) : true
+        });
+      } else if (nextSessionId !== null && attachedSessionId !== nextSessionId) {
+        await setSelectedSession(nextSessionId, {
+          reset: !terminalCursorBySession.has(nextSessionId)
+        });
       } else if (nextSessionId === null) {
         clearTerminalView();
       }
@@ -432,6 +702,7 @@
     } catch (error) {
       console.error("Failed to load data", error);
       unresolvedAlerts = [];
+      reportRuntimeIssue({ error, source: "system" });
     } finally {
       if (!background) {
         loading = false;
@@ -459,9 +730,15 @@
           provider
         }
       });
+      clearRuntimeIssue("adapter_down");
       await loadData();
     } catch (error) {
       console.error("Failed to start managed session", error);
+      reportRuntimeIssue({
+        error,
+        source: "terminal",
+        forcedKind: "adapter_down"
+      });
     }
   }
 
@@ -718,6 +995,8 @@
         await detachTerminalSession(attachedSessionId);
       }
       selectedSessionId = null;
+      terminalViewportState.selectedSessionId = null;
+      persistSelectedSession(null);
       clearTerminalView();
       return;
     }
@@ -727,6 +1006,8 @@
     }
 
     selectedSessionId = sessionId;
+    terminalViewportState.selectedSessionId = sessionId;
+    persistSelectedSession(sessionId);
 
     if (attachedSessionId !== sessionId) {
       await attachTerminalSession(sessionId);
@@ -735,9 +1016,12 @@
     fitAddon?.fit();
     await resizeTerminalSession(sessionId);
 
-    if (reset || terminalCursorBySession.get(sessionId) === undefined) {
+    const hasSavedCursor = terminalCursorBySession.has(sessionId);
+    if (reset || !hasSavedCursor) {
       await hydrateTerminalSession(sessionId, { reset: true });
+      return;
     }
+    await streamTerminalChunks(sessionId);
   }
 
   async function openTerminalPopout() {
@@ -826,12 +1110,18 @@
     if (!queue || queue.length === 0) return;
 
     let writtenBytes = 0;
+    let cursorUpdated = false;
     while (queue.length > 0 && writtenBytes < TERMINAL_FRAME_WRITE_BUDGET_BYTES) {
       const next = queue.shift();
       if (!next) break;
       terminalWidget.write(next.chunk);
       terminalCursorBySession.set(selectedSessionId, next.cursor);
       writtenBytes += next.chunk.length;
+      cursorUpdated = true;
+    }
+
+    if (cursorUpdated) {
+      schedulePersistTerminalCursors();
     }
 
     if (queue.length === 0) {
@@ -897,6 +1187,7 @@
         }
       }
       terminalCursorBySession.set(sessionId, cursor);
+      schedulePersistTerminalCursors();
     } catch (error) {
       console.error("Failed to stream terminal output", error);
     }
@@ -909,6 +1200,7 @@
       terminalWidget?.clear();
       terminalWidget?.reset();
       terminalCursorBySession.set(sessionId, 0);
+      schedulePersistTerminalCursors();
     }
     await streamTerminalChunks(sessionId);
     await resizeTerminalSession(sessionId);
@@ -935,8 +1227,11 @@
       const status = (await invoke("start_voice_cmd")) as VoiceStatus;
       voiceRunning = status.running;
       voiceState = status.state;
+      clearRuntimeIssue("mic_unavailable");
+      clearRuntimeIssue("model_down");
     } catch (error) {
       console.error("Failed to start voice pipeline", error);
+      reportRuntimeIssue({ error, source: "voice" });
     }
   }
 
@@ -947,6 +1242,7 @@
       voiceState = status.state;
     } catch (error) {
       console.error("Failed to stop voice pipeline", error);
+      reportRuntimeIssue({ error, source: "voice" });
     }
   }
 
@@ -959,10 +1255,16 @@
     let startedTemporarily = false;
 
     if (pushToTalk && !voiceRunning) {
-      const status = (await invoke("start_voice_cmd")) as VoiceStatus;
-      voiceRunning = status.running;
-      voiceState = status.state;
-      startedTemporarily = true;
+      try {
+        const status = (await invoke("start_voice_cmd")) as VoiceStatus;
+        voiceRunning = status.running;
+        voiceState = status.state;
+        startedTemporarily = true;
+      } catch (error) {
+        console.error("Failed to start voice pipeline", error);
+        reportRuntimeIssue({ error, source: "voice" });
+        return;
+      }
     }
 
     if (!text) return;
@@ -972,13 +1274,20 @@
         pushToTalkBusy = true;
       }
       await invoke("process_voice_text_cmd", { text: transcript });
+      clearRuntimeIssue("model_down");
     } catch (error) {
       console.error("Failed to process voice text", error);
+      reportRuntimeIssue({ error, source: "voice" });
     } finally {
       if (startedTemporarily) {
-        const status = (await invoke("stop_voice_cmd")) as VoiceStatus;
-        voiceRunning = status.running;
-        voiceState = status.state;
+        try {
+          const status = (await invoke("stop_voice_cmd")) as VoiceStatus;
+          voiceRunning = status.running;
+          voiceState = status.state;
+        } catch (error) {
+          console.error("Failed to stop voice pipeline", error);
+          reportRuntimeIssue({ error, source: "voice" });
+        }
       }
       if (pushToTalk) {
         pushToTalkBusy = false;
@@ -998,8 +1307,11 @@
     pushToTalkBusy = true;
     try {
       await invoke("push_to_talk_cmd");
+      clearRuntimeIssue("mic_unavailable");
+      clearRuntimeIssue("model_down");
     } catch (error) {
       console.error("Failed to run push-to-talk command", error);
+      reportRuntimeIssue({ error, source: "voice" });
     } finally {
       pushToTalkBusy = false;
       invoke("voice_status_cmd")
@@ -1011,6 +1323,7 @@
         })
         .catch((error) => {
           console.error("Failed to refresh voice status", error);
+          reportRuntimeIssue({ error, source: "voice" });
         });
     }
   }
@@ -1088,92 +1401,134 @@
     }
   }
 
-  onMount(() => {
-    let unlistenTask: (() => void) | undefined;
-    let unlistenAgent: (() => void) | undefined;
-    let unlistenTerminal: (() => void) | undefined;
-    let unlistenSession: (() => void) | undefined;
-    let unlistenSessionAlertCreated: (() => void) | undefined;
-    let unlistenSessionPrompt: (() => void) | undefined;
-    let unlistenVoiceState: (() => void) | undefined;
-    let unlistenVoiceTranscript: (() => void) | undefined;
-    let unlistenVoiceIntent: (() => void) | undefined;
-    let unlistenVoiceCommand: (() => void) | undefined;
-    let unlistenVoiceError: (() => void) | undefined;
-    let unlistenVoiceReply: (() => void) | undefined;
+  async function registerUiListeners() {
+    clearUiListeners();
+    try {
+      uiUnlisteners = await Promise.all([
+        listen("task_updated", () => {
+          void loadData();
+        }),
+        listen("agent_updated", () => {
+          void loadData();
+        }),
+        listen("terminal_chunk", (event) => {
+          const payload = event.payload as TerminalChunkEvent;
+          queueTerminalChunk(payload);
+        }),
+        listen("agent_runtime_updated", (event) => {
+          const payload = event.payload as AgentRuntimeUpdatedEvent;
+          if (
+            payload.activeSessionId &&
+            selectedAgentId === payload.agentId &&
+            selectedSessionId !== payload.activeSessionId
+          ) {
+            void setSelectedSession(payload.activeSessionId, { reset: false });
+          }
+          void loadData({ background: true });
+        }),
+        listen("session_alert_created", (event) => {
+          const payload = event.payload as SessionAlertCreatedEvent;
+          upsertUnresolvedAlertFromEvent(payload);
+          enqueueAlertToast(payload);
+          reportRuntimeIssue({ error: payload.message, source: "session_alert" });
+        }),
+        listen("managed_session_prompt_required", async (event) => {
+          const payload = event.payload as ManagedSessionPromptRequiredEvent;
+          if (payload.reason === "missing_command") {
+            await startSession(selectedAgentId || undefined, selectedAgent?.taskId ?? undefined);
+            return;
+          }
+          if (payload.reason === "confirmation_required" && payload.source === "voice") {
+            const candidate = lastVoiceCommandText.trim() || voiceInput.trim();
+            if (!candidate) return;
+            const ok = window.confirm(payload.message ?? "Voice command requires confirmation.");
+            if (!ok) return;
+            await runVoiceText(candidate, { pushToTalk: true, confirmed: true });
+          }
+        }),
+        listen("voice_state_updated", (event) => {
+          const payload = event.payload as { state: string };
+          voiceState = payload.state;
+        }),
+        listen("voice_transcript", (event) => {
+          const payload = event.payload as { text: string };
+          lastTranscript = payload.text;
+          lastVoiceCommandText = payload.text;
+        }),
+        listen("voice_intent", (event) => {
+          const payload = event.payload as VoiceIntentEvent;
+          lastIntent = `${payload.action} ${JSON.stringify(payload.payload)}`;
+        }),
+        listen("voice_action_executed", (event) => {
+          const payload = event.payload as VoiceAction;
+          lastCommand = `${payload.action} (${payload.result})`;
+          void loadData({ background: true });
+        }),
+        listen("voice_error", (event) => {
+          const payload = event.payload as { message: string };
+          lastCommand = `error: ${payload.message}`;
+          reportRuntimeIssue({ error: payload.message, source: "voice" });
+        }),
+        listen("voice_status_reply", (event) => {
+          const payload = event.payload as VoiceStatusReplyEvent;
+          lastCommand = payload.summary;
+        })
+      ]);
+      listenerReconnectAttempts = 0;
+      return true;
+    } catch (error) {
+      console.error("Failed to register UI listeners", error);
+      reportRuntimeIssue({ error, source: "system" });
+      clearUiListeners();
+      return false;
+    }
+  }
 
-    void initTerminalWidget();
-
-    const startListeners = async () => {
-      unlistenTask = await listen("task_updated", () => {
-        void loadData();
-      });
-      unlistenAgent = await listen("agent_updated", () => {
-        void loadData();
-      });
-      unlistenTerminal = await listen("terminal_chunk", (event) => {
-        const payload = event.payload as TerminalChunkEvent;
-        queueTerminalChunk(payload);
-      });
-      unlistenSession = await listen("agent_runtime_updated", (event) => {
-        const payload = event.payload as AgentRuntimeUpdatedEvent;
-        if (
-          payload.activeSessionId &&
-          selectedAgentId === payload.agentId &&
-          selectedSessionId !== payload.activeSessionId
-        ) {
-          void setSelectedSession(payload.activeSessionId, { reset: false });
-        }
-        void loadData({ background: true });
-      });
-      unlistenSessionAlertCreated = await listen("session_alert_created", (event) => {
-        const payload = event.payload as SessionAlertCreatedEvent;
-        upsertUnresolvedAlertFromEvent(payload);
-        enqueueAlertToast(payload);
-      });
-      unlistenSessionPrompt = await listen("managed_session_prompt_required", async (event) => {
-        const payload = event.payload as ManagedSessionPromptRequiredEvent;
-        if (payload.reason === "missing_command") {
-          await startSession(selectedAgentId || undefined, selectedAgent?.taskId ?? undefined);
+  function scheduleUiListenerReconnect(reason: string) {
+    if (listenerLifecycleStopped || listenerReconnectTimer) return;
+    listenerReconnectAttempts += 1;
+    const delayMs = listenerReconnectDelayMs(listenerReconnectAttempts);
+    listenerReconnectTimer = window.setTimeout(() => {
+      listenerReconnectTimer = 0;
+      void registerUiListeners().then((connected) => {
+        if (!connected) {
+          scheduleUiListenerReconnect("listener reconnect retry");
           return;
         }
-        if (payload.reason === "confirmation_required" && payload.source === "voice") {
-          const candidate = lastVoiceCommandText.trim() || voiceInput.trim();
-          if (!candidate) return;
-          const ok = window.confirm(payload.message ?? "Voice command requires confirmation.");
-          if (!ok) return;
-          await runVoiceText(candidate, { pushToTalk: true, confirmed: true });
+        void loadData({ background: true });
+        if (selectedSessionId) {
+          void resyncTerminalStream(selectedSessionId);
         }
       });
-      unlistenVoiceState = await listen("voice_state_updated", (event) => {
-        const payload = event.payload as { state: string };
-        voiceState = payload.state;
-      });
-      unlistenVoiceTranscript = await listen("voice_transcript", (event) => {
-        const payload = event.payload as { text: string };
-        lastTranscript = payload.text;
-        lastVoiceCommandText = payload.text;
-      });
-      unlistenVoiceIntent = await listen("voice_intent", (event) => {
-        const payload = event.payload as VoiceIntentEvent;
-        lastIntent = `${payload.action} ${JSON.stringify(payload.payload)}`;
-      });
-      unlistenVoiceCommand = await listen("voice_action_executed", (event) => {
-        const payload = event.payload as VoiceAction;
-        lastCommand = `${payload.action} (${payload.result})`;
-        void loadData({ background: true });
-      });
-      unlistenVoiceError = await listen("voice_error", (event) => {
-        const payload = event.payload as { message: string };
-        lastCommand = `error: ${payload.message}`;
-      });
-      unlistenVoiceReply = await listen("voice_status_reply", (event) => {
-        const payload = event.payload as VoiceStatusReplyEvent;
-        lastCommand = payload.summary;
-      });
-    };
+    }, delayMs);
+    console.warn(
+      `Scheduling UI listener reconnect in ${delayMs}ms (reason: ${reason}, attempt: ${listenerReconnectAttempts})`
+    );
+  }
 
-    void startListeners();
+  function handleWindowResume() {
+    if (document.visibilityState === "hidden") return;
+    if (uiUnlisteners.length === 0) {
+      scheduleUiListenerReconnect("window resume with no listeners");
+      return;
+    }
+    void loadData({ background: true });
+    if (selectedSessionId) {
+      void resyncTerminalStream(selectedSessionId);
+    }
+  }
+
+  onMount(() => {
+    listenerLifecycleStopped = false;
+    restoreTerminalViewportState();
+    terminalViewportState.selectedSessionId = selectedSessionId;
+    void initTerminalWidget();
+
+    void registerUiListeners().then((connected) => {
+      if (!connected) {
+        scheduleUiListenerReconnect("initial listener registration failed");
+      }
+    });
 
     invoke("voice_status_cmd")
       .then((status) => {
@@ -1184,10 +1539,14 @@
       })
       .catch((error) => {
         console.error("Failed to get voice status", error);
+        reportRuntimeIssue({ error, source: "voice" });
       });
 
     const interval = setInterval(() => {
       void loadData({ background: true });
+      if (selectedSessionId) {
+        void streamTerminalChunks(selectedSessionId);
+      }
     }, 8000);
     void loadData();
 
@@ -1205,11 +1564,27 @@
       resizeObserver.observe(terminalContainer);
     }
     window.addEventListener("keydown", handleGlobalKeydown);
+    window.addEventListener("focus", handleWindowResume);
+    document.addEventListener("visibilitychange", handleWindowResume);
+    window.addEventListener("beforeunload", persistTerminalCursors);
 
     return () => {
+      listenerLifecycleStopped = true;
       clearInterval(interval);
       resizeObserver?.disconnect();
       window.removeEventListener("keydown", handleGlobalKeydown);
+      window.removeEventListener("focus", handleWindowResume);
+      document.removeEventListener("visibilitychange", handleWindowResume);
+      window.removeEventListener("beforeunload", persistTerminalCursors);
+      if (listenerReconnectTimer) {
+        window.clearTimeout(listenerReconnectTimer);
+        listenerReconnectTimer = 0;
+      }
+      if (terminalCursorPersistTimer) {
+        window.clearTimeout(terminalCursorPersistTimer);
+        terminalCursorPersistTimer = 0;
+      }
+      persistTerminalCursors();
       if (terminalFlushRaf) {
         window.cancelAnimationFrame(terminalFlushRaf);
         terminalFlushRaf = 0;
@@ -1224,18 +1599,7 @@
       terminalWidget?.dispose();
       terminalWidget = null;
       fitAddon = null;
-      unlistenTask?.();
-      unlistenAgent?.();
-      unlistenTerminal?.();
-      unlistenSession?.();
-      unlistenSessionAlertCreated?.();
-      unlistenSessionPrompt?.();
-      unlistenVoiceState?.();
-      unlistenVoiceTranscript?.();
-      unlistenVoiceIntent?.();
-      unlistenVoiceCommand?.();
-      unlistenVoiceError?.();
-      unlistenVoiceReply?.();
+      clearUiListeners();
       for (const timer of alertToastTimers.values()) {
         window.clearTimeout(timer);
       }
@@ -1257,6 +1621,31 @@
           <button class="ghost compact" onclick={() => dismissAlertToast(toast.id)}>Dismiss</button>
         </article>
       {/each}
+    </section>
+  {/if}
+
+  {#if activeRuntimeIssues.length > 0}
+    <section class="runtime-issues-panel" aria-live="polite" aria-label="Runtime issues">
+      <header class="runtime-issues-header">
+        <h2>System issues</h2>
+        <span>{activeRuntimeIssues.length}</span>
+      </header>
+      <div class="runtime-issues-list">
+        {#each activeRuntimeIssues as issue (issue.kind)}
+          <article class={`runtime-issue severity-${issue.severity}`}>
+            <div class="runtime-issue-copy">
+              <strong>{issue.title}</strong>
+              <p>{issue.message}</p>
+              <p>{issue.guidance}</p>
+              <span>
+                Source: {issue.source} · Seen {formatRelativeTime(new Date(issue.lastSeenAt).toISOString())} ·
+                Count {issue.count}
+              </span>
+            </div>
+            <button class="ghost compact" onclick={() => dismissRuntimeIssue(issue.kind)}>Dismiss</button>
+          </article>
+        {/each}
+      </div>
     </section>
   {/if}
 
@@ -1593,6 +1982,83 @@
   .alert-toast-open span {
     font-size: 11px;
     color: rgba(221, 231, 239, 0.84);
+  }
+
+  .runtime-issues-panel {
+    border: 1px solid rgba(255, 123, 114, 0.46);
+    border-radius: 12px;
+    background: rgba(31, 12, 14, 0.9);
+    padding: 10px;
+    display: grid;
+    gap: 8px;
+  }
+
+  .runtime-issues-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .runtime-issues-header h2 {
+    margin: 0;
+    font-size: 12px;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+
+  .runtime-issues-header span {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgba(255, 208, 205, 0.85);
+  }
+
+  .runtime-issues-list {
+    display: grid;
+    gap: 7px;
+  }
+
+  .runtime-issue {
+    border-radius: 10px;
+    border: 1px solid rgba(255, 123, 114, 0.5);
+    background: rgba(43, 14, 17, 0.74);
+    padding: 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .runtime-issue.severity-warning {
+    border-color: rgba(255, 184, 92, 0.55);
+    background: rgba(45, 30, 14, 0.7);
+  }
+
+  .runtime-issue-copy {
+    min-width: 0;
+    display: grid;
+    gap: 4px;
+  }
+
+  .runtime-issue-copy strong,
+  .runtime-issue-copy p,
+  .runtime-issue-copy span {
+    margin: 0;
+  }
+
+  .runtime-issue-copy strong {
+    font-size: 12px;
+  }
+
+  .runtime-issue-copy p {
+    font-size: 11px;
+    color: rgba(237, 223, 222, 0.92);
+  }
+
+  .runtime-issue-copy span {
+    font-size: 10px;
+    color: rgba(229, 204, 203, 0.85);
   }
 
   .workspace {
