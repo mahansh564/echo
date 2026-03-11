@@ -7,6 +7,7 @@ pub struct EchoConfig {
     pub mic_device: String,
     pub hotkey: String,
     pub model_endpoint: String,
+    // Deprecated runtime toggle: kept for config backward compatibility only.
     pub voice_enabled: bool,
     pub voice_summary_loop_enabled: bool,
     pub voice_summary_loop_interval_sec: u64,
@@ -87,6 +88,7 @@ pub fn load_config() -> Result<EchoConfig> {
             if let Some(value) = partial.model_endpoint {
                 config.model_endpoint = value;
             }
+            // Deprecated runtime toggle: preserved only to avoid rejecting legacy config files.
             if let Some(value) = partial.voice_enabled {
                 config.voice_enabled = value;
             }

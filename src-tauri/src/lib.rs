@@ -36,10 +36,8 @@ pub fn run() {
             app.manage(terminal.clone());
             let config = config::load_config()?;
             let voice = VoiceManager::new();
-            if config.voice_enabled {
-                let db_state = app.state::<db::Db>().inner().clone();
-                let _ = voice.start(app.handle(), &config, db_state, terminal.clone());
-            }
+            let db_state = app.state::<db::Db>().inner().clone();
+            let _ = voice.start(app.handle(), &config, db_state, terminal.clone());
             app.manage(config);
             app.manage(voice);
             Ok(())
@@ -72,8 +70,6 @@ pub fn run() {
             commands::terminal::send_terminal_data_cmd,
             commands::terminal::attach_terminal_session_cmd,
             commands::terminal::detach_terminal_session_cmd,
-            commands::voice::start_voice_cmd,
-            commands::voice::stop_voice_cmd,
             commands::voice::voice_status_cmd,
             commands::voice::process_voice_text_cmd,
             commands::voice::push_to_talk_cmd,
