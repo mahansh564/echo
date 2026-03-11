@@ -242,6 +242,58 @@ async fn reconcile_orphan_sessions_marks_open_rows_failed() {
     assert_eq!(updated.status, "failed");
 }
 
+#[tokio::test]
+async fn stop_session_is_idempotent_for_db_open_rows_without_runtime() {
+    let db = Db::connect("sqlite::memory:").await.expect("db");
+    let session = db
+        .create_managed_session("opencode", "opencode", "[]", None, None, None, None)
+        .await
+        .expect("session");
+    db.update_session_status(session.id, "active", None)
+        .await
+        .expect("active");
+
+    let manager = TerminalManager::new();
+    manager
+        .stop_session(db.clone(), session.id)
+        .expect("stop should be idempotent");
+
+    let start = Instant::now();
+    loop {
+        let updated = db
+            .get_managed_session(session.id)
+            .await
+            .expect("session row");
+        if updated.status == "ended" {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "timed out waiting for session to end"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn attach_session_rejects_when_runtime_is_missing() {
+    let db = Db::connect("sqlite::memory:").await.expect("db");
+    let session = db
+        .create_managed_session("opencode", "opencode", "[]", None, None, None, None)
+        .await
+        .expect("session");
+    db.update_session_status(session.id, "active", None)
+        .await
+        .expect("active");
+
+    let manager = TerminalManager::new();
+    let err = manager
+        .attach_session(&db, session.id)
+        .await
+        .expect_err("attach should require an active runtime handle");
+    assert!(err.to_string().contains("runtime is not available"));
+}
+
 #[test]
 fn session_output_buffer_trims_to_limit_and_advances_base_cursor() {
     let mut buffer = SessionOutputBuffer::with_limit(8);

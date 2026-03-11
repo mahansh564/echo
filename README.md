@@ -170,12 +170,12 @@ This roadmap assumes a v1 target of up to 10 concurrent active sessions and prio
 - [x] Add structured logs and metrics for session churn, alert latency, and voice command success.
 - [x] Add reconnect/reload behavior for UI listeners and terminal stream cursors.
 - [x] Add robust error surfaces in UI (adapter down, model down, mic unavailable).
-- [ ] Hardening pass for race conditions around stop/restart/attach.
+- [x] Hardening pass for race conditions around stop/restart/attach.
 
 ### Phase 8 - Verification and Release
 
-- [ ] End-to-end test matrix for agent lifecycle + voice control + terminal attach.
-- [ ] Manual QA scripts for the 10-agent load scenario.
+- [x] End-to-end test matrix for agent lifecycle + voice control + terminal attach (`docs/verification/e2e-test-matrix.md`).
+- [x] Manual QA scripts for the 10-agent load scenario (`docs/verification/manual-qa-10-agent-load.md`).
 - [ ] Release checklist with migration safety, rollback, and feature flagging.
 - [ ] Ship v1 docs: setup, provider config, voice setup, troubleshooting.
 - [ ] Capture post-v1 backlog for multi-provider expansion.

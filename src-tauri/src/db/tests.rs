@@ -198,6 +198,36 @@ async fn terminal_attach_detach_updates_attach_count() {
 }
 
 #[tokio::test]
+async fn end_session_if_open_is_idempotent_and_clears_attach_count() {
+    let db = setup_test_db().await;
+    let session = db
+        .create_managed_session("opencode", "opencode", "[]", None, None, None, None)
+        .await
+        .unwrap();
+    db.update_session_status(session.id, "active", None)
+        .await
+        .unwrap();
+    db.attach_terminal_session(session.id).await.unwrap();
+    db.attach_terminal_session(session.id).await.unwrap();
+
+    let ended = db
+        .end_session_if_open(session.id, Some("stopped by user"))
+        .await
+        .unwrap();
+    assert!(ended);
+
+    let stored = db.get_managed_session(session.id).await.unwrap();
+    assert_eq!(stored.status, "ended");
+    assert_eq!(stored.attach_count, 0);
+
+    let ended_again = db
+        .end_session_if_open(session.id, Some("stopped by user"))
+        .await
+        .unwrap();
+    assert!(!ended_again);
+}
+
+#[tokio::test]
 async fn list_agent_rows_includes_runtime_session_summary() {
     let db = setup_test_db().await;
     let task = db

@@ -228,10 +228,12 @@ pub async fn send_terminal_data_cmd(
 
 #[tauri::command]
 pub async fn attach_terminal_session_cmd(
+    terminal: tauri::State<'_, TerminalManager>,
     db: tauri::State<'_, Db>,
     session_id: i64,
 ) -> Result<ManagedSession, String> {
-    db.attach_terminal_session(session_id)
+    terminal
+        .attach_session(db.inner(), session_id)
         .await
         .map_err(|e| e.to_string())
 }

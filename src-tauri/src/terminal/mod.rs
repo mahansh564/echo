@@ -240,6 +240,10 @@ impl TerminalManager {
         self.supervisor.send_input(session_id, input)
     }
 
+    pub async fn attach_session(&self, db: &Db, session_id: i64) -> Result<ManagedSession> {
+        self.supervisor.attach_session(db, session_id).await
+    }
+
     pub fn resize_session(&self, session_id: i64, cols: u16, rows: u16) -> Result<()> {
         self.supervisor.resize_session(session_id, cols, rows)
     }
@@ -398,6 +402,14 @@ impl SessionSupervisor {
         db: Db,
         request: StartSessionRequest,
     ) -> Result<ManagedSession> {
+        if let Some(agent_id) = request.agent_id {
+            if let Ok(agent) = db.get_agent(agent_id).await {
+                if let Some(previous_session_id) = agent.active_session_id {
+                    let _ = self.stop_session(db.clone(), previous_session_id);
+                }
+            }
+        }
+
         let requested_provider = request
             .provider
             .clone()
@@ -843,23 +855,41 @@ impl SessionSupervisor {
 
     pub fn stop_session(&self, db: Db, session_id: i64) -> Result<()> {
         let mut sessions = self.sessions.lock().unwrap();
-        let handle = sessions
-            .remove(&session_id)
-            .ok_or_else(|| anyhow!("session not found"))?;
-
-        handle.stopped.store(true, Ordering::SeqCst);
-        if let Ok(mut child) = handle.child.lock() {
-            let _ = child.kill();
+        if let Some(handle) = sessions.remove(&session_id) {
+            handle.stopped.store(true, Ordering::SeqCst);
+            if let Ok(mut child) = handle.child.lock() {
+                let _ = child.kill();
+            }
         }
+        drop(sessions);
 
         tauri::async_runtime::spawn(async move {
-            let _ = db.end_session(session_id, Some("stopped by user")).await;
-            let _ = db
-                .insert_session_event(session_id, "ended", Some("stopped by user"), None)
-                .await;
+            let ended = db
+                .end_session_if_open(session_id, Some("stopped by user"))
+                .await
+                .unwrap_or(false);
+            if ended {
+                let _ = db
+                    .insert_session_event(session_id, "ended", Some("stopped by user"), None)
+                    .await;
+            }
         });
 
         Ok(())
+    }
+
+    pub async fn attach_session(&self, db: &Db, session_id: i64) -> Result<ManagedSession> {
+        if !self.has_session(session_id) {
+            return Err(anyhow!("session runtime is not available for attach"));
+        }
+
+        let updated = db.attach_terminal_session(session_id).await?;
+        if !self.has_session(session_id) {
+            let _ = db.detach_terminal_session(session_id).await;
+            return Err(anyhow!("session ended before attach completed"));
+        }
+
+        Ok(updated)
     }
 
     pub fn last_snippet(&self, session_id: i64) -> Option<String> {

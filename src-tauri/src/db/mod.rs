@@ -348,16 +348,47 @@ impl Db {
         failure_reason: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
-            "UPDATE managed_sessions SET status = ?, failure_reason = ?, started_at = CASE WHEN ? = 'active' AND started_at IS NULL THEN CURRENT_TIMESTAMP ELSE started_at END, ended_at = CASE WHEN ? IN ('ended', 'failed') THEN CURRENT_TIMESTAMP ELSE ended_at END, last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE managed_sessions SET status = ?, failure_reason = ?, started_at = CASE WHEN ? = 'active' AND started_at IS NULL THEN CURRENT_TIMESTAMP ELSE started_at END, ended_at = CASE WHEN ? IN ('ended', 'failed') THEN CURRENT_TIMESTAMP ELSE ended_at END, attach_count = CASE WHEN ? IN ('ended', 'failed') THEN 0 ELSE attach_count END, last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(status)
         .bind(failure_reason)
+        .bind(status)
         .bind(status)
         .bind(status)
         .bind(session_id)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn end_session_if_open(&self, session_id: i64, reason: Option<&str>) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE managed_sessions
+             SET status = 'ended',
+                 failure_reason = ?,
+                 ended_at = CURRENT_TIMESTAMP,
+                 needs_input = 0,
+                 input_reason = NULL,
+                 attach_count = 0,
+                 last_activity_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?
+               AND status IN ('waking', 'active', 'stalled', 'needs_input')",
+        )
+        .bind(reason)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            sqlx::query("UPDATE agents SET active_session_id = NULL WHERE active_session_id = ?")
+                .bind(session_id)
+                .execute(&self.pool)
+                .await?;
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     pub async fn mark_session_stalled_if_not_needs_input(&self, session_id: i64) -> Result<bool> {
@@ -569,7 +600,7 @@ impl Db {
 
     pub async fn end_session(&self, session_id: i64, reason: Option<&str>) -> Result<()> {
         sqlx::query(
-            "UPDATE managed_sessions SET status = 'ended', failure_reason = ?, ended_at = CURRENT_TIMESTAMP, needs_input = 0, input_reason = NULL, last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE managed_sessions SET status = 'ended', failure_reason = ?, ended_at = CURRENT_TIMESTAMP, needs_input = 0, input_reason = NULL, attach_count = 0, last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(reason)
         .bind(session_id)
