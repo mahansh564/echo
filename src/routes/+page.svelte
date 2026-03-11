@@ -244,7 +244,6 @@
   let selectedAgentId = $state<number>(0);
   let loading = $state<boolean>(true);
   let hasLoadedOnce = $state<boolean>(false);
-  let voiceRunning = $state<boolean>(false);
   let voiceState = $state<string>("idle");
   let lastTranscript = $state<string>("");
   let lastIntent = $state<string>("");
@@ -898,7 +897,7 @@
         break;
       case "voice-query-input-needed":
         closeCommandPalette();
-        await runVoiceText("which agents need input", { pushToTalk: true });
+        await runVoiceText("which agents need input");
         break;
       default:
         break;
@@ -1222,76 +1221,18 @@
     }
   }
 
-  async function startVoice() {
-    try {
-      const status = (await invoke("start_voice_cmd")) as VoiceStatus;
-      voiceRunning = status.running;
-      voiceState = status.state;
-      clearRuntimeIssue("mic_unavailable");
-      clearRuntimeIssue("model_down");
-    } catch (error) {
-      console.error("Failed to start voice pipeline", error);
-      reportRuntimeIssue({ error, source: "voice" });
-    }
-  }
-
-  async function stopVoice() {
-    try {
-      const status = (await invoke("stop_voice_cmd")) as VoiceStatus;
-      voiceRunning = status.running;
-      voiceState = status.state;
-    } catch (error) {
-      console.error("Failed to stop voice pipeline", error);
-      reportRuntimeIssue({ error, source: "voice" });
-    }
-  }
-
-  async function runVoiceText(
-    text: string,
-    options: { pushToTalk?: boolean; confirmed?: boolean } = {}
-  ) {
-    const { pushToTalk = false, confirmed = false } = options;
+  async function runVoiceText(text: string, options: { confirmed?: boolean } = {}) {
+    const { confirmed = false } = options;
     const transcript = confirmed ? `confirm ${text}` : text;
-    let startedTemporarily = false;
-
-    if (pushToTalk && !voiceRunning) {
-      try {
-        const status = (await invoke("start_voice_cmd")) as VoiceStatus;
-        voiceRunning = status.running;
-        voiceState = status.state;
-        startedTemporarily = true;
-      } catch (error) {
-        console.error("Failed to start voice pipeline", error);
-        reportRuntimeIssue({ error, source: "voice" });
-        return;
-      }
-    }
 
     if (!text) return;
 
     try {
-      if (pushToTalk) {
-        pushToTalkBusy = true;
-      }
       await invoke("process_voice_text_cmd", { text: transcript });
       clearRuntimeIssue("model_down");
     } catch (error) {
       console.error("Failed to process voice text", error);
       reportRuntimeIssue({ error, source: "voice" });
-    } finally {
-      if (startedTemporarily) {
-        try {
-          const status = (await invoke("stop_voice_cmd")) as VoiceStatus;
-          voiceRunning = status.running;
-          voiceState = status.state;
-        } catch (error) {
-          console.error("Failed to stop voice pipeline", error);
-          reportRuntimeIssue({ error, source: "voice" });
-        }
-      }
-      if (pushToTalk) {
-        pushToTalkBusy = false;
-      }
     }
   }
 
@@ -1317,7 +1258,6 @@
       invoke("voice_status_cmd")
         .then((status) => {
           const typed = status as VoiceStatus;
-          voiceRunning = typed.running;
           voiceState = typed.state;
           lastTranscript = typed.lastTranscript ?? lastTranscript;
         })
@@ -1443,7 +1383,7 @@
             if (!candidate) return;
             const ok = window.confirm(payload.message ?? "Voice command requires confirmation.");
             if (!ok) return;
-            await runVoiceText(candidate, { pushToTalk: true, confirmed: true });
+            await runVoiceText(candidate, { confirmed: true });
           }
         }),
         listen("voice_state_updated", (event) => {
@@ -1533,7 +1473,6 @@
     invoke("voice_status_cmd")
       .then((status) => {
         const typed = status as VoiceStatus;
-        voiceRunning = typed.running;
         voiceState = typed.state;
         lastTranscript = typed.lastTranscript ?? "";
       })
@@ -1823,11 +1762,6 @@
     </div>
 
     <div class="voice-actions">
-      {#if voiceRunning}
-        <button class="ghost" onclick={stopVoice}>Stop voice</button>
-      {:else}
-        <button class="ghost" onclick={startVoice}>Start voice</button>
-      {/if}
       <button class="ghost" onclick={() => void openCommandPalette()}>Palette (Cmd/Ctrl+K)</button>
       <button class="ghost" onclick={pushToTalkVoiceText} disabled={pushToTalkBusy}>
         {pushToTalkBusy ? "Listening..." : "Push to talk"}
