@@ -55,6 +55,8 @@
     cursor: number;
   };
 
+  type UnlistenFn = () => void;
+
   let loading = $state<boolean>(true);
   let hasLoadedOnce = $state<boolean>(false);
   let sessions = $state<SessionRuntime[]>([]);
@@ -68,6 +70,11 @@
   let fitAddon: FitAddon | null = null;
   let terminalDataListener: { dispose: () => void } | null = null;
   let terminalFlushRaf = 0;
+  let terminalCursorPersistTimer = 0;
+  let listenerReconnectTimer = 0;
+  let listenerReconnectAttempts = 0;
+  let listenerLifecycleStopped = false;
+  let uiUnlisteners: UnlistenFn[] = [];
 
   const terminalCursorBySession = new Map<number, number>();
   const bufferedTerminalChunks = new Map<number, BufferedTerminalChunk[]>();
@@ -77,6 +84,10 @@
   const TERMINAL_MAX_DRAIN_ITERATIONS = 8;
   const TERMINAL_FRAME_WRITE_BUDGET_BYTES = 32_768;
   const TERMINAL_MAX_PENDING_CHUNKS = 512;
+  const TERMINAL_CURSOR_STORAGE_KEY = "echo.popout.terminal-cursors.v1";
+  const TERMINAL_CURSOR_PERSIST_DEBOUNCE_MS = 250;
+  const LISTENER_RECONNECT_BASE_MS = 1000;
+  const LISTENER_RECONNECT_MAX_MS = 15000;
   const ACTIVE_SESSION_STATUSES = new Set<SessionRuntime["status"]>([
     "waking",
     "active",
@@ -101,6 +112,63 @@
 
   function readSessionIdFromUrl() {
     return parseSessionId(new URLSearchParams(window.location.search).get("sessionId"));
+  }
+
+  function restoreTerminalCursorState() {
+    if (typeof window === "undefined") return;
+    const rawCursorState = window.sessionStorage.getItem(TERMINAL_CURSOR_STORAGE_KEY);
+    if (!rawCursorState) return;
+    try {
+      const parsed = JSON.parse(rawCursorState) as Record<string, unknown>;
+      for (const [key, value] of Object.entries(parsed)) {
+        const sessionId = parseSessionId(key);
+        if (!sessionId) continue;
+        const cursor =
+          typeof value === "number" && Number.isFinite(value) && value >= 0
+            ? Math.floor(value)
+            : null;
+        if (cursor === null) continue;
+        terminalCursorBySession.set(sessionId, cursor);
+      }
+    } catch (error) {
+      console.error("Failed to restore popout terminal cursor state", error);
+    }
+  }
+
+  function persistTerminalCursors() {
+    if (typeof window === "undefined") return;
+    const cursorState: Record<string, number> = {};
+    for (const [sessionId, cursor] of terminalCursorBySession.entries()) {
+      if (!Number.isFinite(cursor) || cursor < 0) continue;
+      cursorState[String(sessionId)] = Math.floor(cursor);
+    }
+    if (Object.keys(cursorState).length === 0) {
+      window.sessionStorage.removeItem(TERMINAL_CURSOR_STORAGE_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify(cursorState));
+  }
+
+  function schedulePersistTerminalCursors() {
+    if (typeof window === "undefined") return;
+    if (terminalCursorPersistTimer) return;
+    terminalCursorPersistTimer = window.setTimeout(() => {
+      terminalCursorPersistTimer = 0;
+      persistTerminalCursors();
+    }, TERMINAL_CURSOR_PERSIST_DEBOUNCE_MS);
+  }
+
+  const listenerReconnectDelayMs = (attempt: number) =>
+    Math.min(
+      LISTENER_RECONNECT_MAX_MS,
+      LISTENER_RECONNECT_BASE_MS * Math.pow(2, Math.max(0, attempt - 1))
+    );
+
+  function clearUiListeners() {
+    for (const unlisten of uiUnlisteners) {
+      unlisten();
+    }
+    uiUnlisteners = [];
   }
 
   const toTitleCase = (value: string) =>
@@ -172,7 +240,13 @@
       }
 
       if (nextSessionId !== selectedSessionId) {
-        await setSelectedSession(nextSessionId, { reset: true });
+        await setSelectedSession(nextSessionId, {
+          reset: nextSessionId !== null ? !terminalCursorBySession.has(nextSessionId) : true
+        });
+      } else if (nextSessionId !== null && attachedSessionId !== nextSessionId) {
+        await setSelectedSession(nextSessionId, {
+          reset: !terminalCursorBySession.has(nextSessionId)
+        });
       } else if (nextSessionId === null) {
         clearTerminalView();
       }
@@ -235,9 +309,12 @@
     fitAddon?.fit();
     await resizeTerminalSession(sessionId);
 
-    if (reset || terminalCursorBySession.get(sessionId) === undefined) {
+    const hasSavedCursor = terminalCursorBySession.has(sessionId);
+    if (reset || !hasSavedCursor) {
       await hydrateTerminalSession(sessionId, { reset: true });
+      return;
     }
+    await streamTerminalChunks(sessionId);
   }
 
   function clearTerminalView() {
@@ -265,12 +342,18 @@
     if (!queue || queue.length === 0) return;
 
     let writtenBytes = 0;
+    let cursorUpdated = false;
     while (queue.length > 0 && writtenBytes < TERMINAL_FRAME_WRITE_BUDGET_BYTES) {
       const next = queue.shift();
       if (!next) break;
       terminalWidget.write(next.chunk);
       terminalCursorBySession.set(selectedSessionId, next.cursor);
       writtenBytes += next.chunk.length;
+      cursorUpdated = true;
+    }
+
+    if (cursorUpdated) {
+      schedulePersistTerminalCursors();
     }
 
     if (queue.length === 0) {
@@ -337,6 +420,7 @@
         }
       }
       terminalCursorBySession.set(sessionId, cursor);
+      schedulePersistTerminalCursors();
     } catch (error) {
       console.error("Failed to stream popout terminal output", error);
     }
@@ -349,6 +433,7 @@
       terminalWidget?.clear();
       terminalWidget?.reset();
       terminalCursorBySession.set(sessionId, 0);
+      schedulePersistTerminalCursors();
     }
     await streamTerminalChunks(sessionId);
     await resizeTerminalSession(sessionId);
@@ -427,34 +512,84 @@
     }
   }
 
-  onMount(() => {
-    let unlistenTerminal: (() => void) | undefined;
-    let unlistenFocusSession: (() => void) | undefined;
+  async function registerUiListeners() {
+    clearUiListeners();
+    try {
+      uiUnlisteners = await Promise.all([
+        listen("terminal_chunk", (event) => {
+          const payload = event.payload as TerminalChunkEvent;
+          queueTerminalChunk(payload);
+        }),
+        listen("terminal-popout-focus-session", (event) => {
+          const payload = event.payload as FocusSessionEvent;
+          const targetSessionId =
+            typeof payload?.sessionId === "number" && payload.sessionId > 0
+              ? payload.sessionId
+              : null;
+          if (targetSessionId) {
+            void setSelectedSession(targetSessionId, { reset: true });
+          }
+        })
+      ]);
+      listenerReconnectAttempts = 0;
+      return true;
+    } catch (error) {
+      console.error("Failed to register popout listeners", error);
+      clearUiListeners();
+      return false;
+    }
+  }
 
-    void initTerminalWidget();
-
-    const startListeners = async () => {
-      unlistenTerminal = await listen("terminal_chunk", (event) => {
-        const payload = event.payload as TerminalChunkEvent;
-        queueTerminalChunk(payload);
-      });
-
-      unlistenFocusSession = await listen("terminal-popout-focus-session", (event) => {
-        const payload = event.payload as FocusSessionEvent;
-        const targetSessionId =
-          typeof payload?.sessionId === "number" && payload.sessionId > 0
-            ? payload.sessionId
-            : null;
-        if (targetSessionId) {
-          void setSelectedSession(targetSessionId, { reset: true });
+  function scheduleUiListenerReconnect(reason: string) {
+    if (listenerLifecycleStopped || listenerReconnectTimer) return;
+    listenerReconnectAttempts += 1;
+    const delayMs = listenerReconnectDelayMs(listenerReconnectAttempts);
+    listenerReconnectTimer = window.setTimeout(() => {
+      listenerReconnectTimer = 0;
+      void registerUiListeners().then((connected) => {
+        if (!connected) {
+          scheduleUiListenerReconnect("popout listener reconnect retry");
+          return;
+        }
+        void loadSessions({ background: true });
+        if (selectedSessionId) {
+          void resyncTerminalStream(selectedSessionId);
         }
       });
-    };
+    }, delayMs);
+    console.warn(
+      `Scheduling popout listener reconnect in ${delayMs}ms (reason: ${reason}, attempt: ${listenerReconnectAttempts})`
+    );
+  }
 
-    void startListeners();
+  function handleWindowResume() {
+    if (document.visibilityState === "hidden") return;
+    if (uiUnlisteners.length === 0) {
+      scheduleUiListenerReconnect("window resume with no popout listeners");
+      return;
+    }
+    void loadSessions({ background: true });
+    if (selectedSessionId) {
+      void resyncTerminalStream(selectedSessionId);
+    }
+  }
+
+  onMount(() => {
+    listenerLifecycleStopped = false;
+    restoreTerminalCursorState();
+    void initTerminalWidget();
+
+    void registerUiListeners().then((connected) => {
+      if (!connected) {
+        scheduleUiListenerReconnect("initial popout listener registration failed");
+      }
+    });
 
     const interval = setInterval(() => {
       void loadSessions({ background: true });
+      if (selectedSessionId) {
+        void streamTerminalChunks(selectedSessionId);
+      }
     }, 8000);
     void loadSessions();
 
@@ -472,9 +607,26 @@
       resizeObserver.observe(terminalContainer);
     }
 
+    window.addEventListener("focus", handleWindowResume);
+    document.addEventListener("visibilitychange", handleWindowResume);
+    window.addEventListener("beforeunload", persistTerminalCursors);
+
     return () => {
+      listenerLifecycleStopped = true;
       clearInterval(interval);
       resizeObserver?.disconnect();
+      window.removeEventListener("focus", handleWindowResume);
+      document.removeEventListener("visibilitychange", handleWindowResume);
+      window.removeEventListener("beforeunload", persistTerminalCursors);
+      if (listenerReconnectTimer) {
+        window.clearTimeout(listenerReconnectTimer);
+        listenerReconnectTimer = 0;
+      }
+      if (terminalCursorPersistTimer) {
+        window.clearTimeout(terminalCursorPersistTimer);
+        terminalCursorPersistTimer = 0;
+      }
+      persistTerminalCursors();
       if (terminalFlushRaf) {
         window.cancelAnimationFrame(terminalFlushRaf);
         terminalFlushRaf = 0;
@@ -489,8 +641,7 @@
       terminalWidget?.dispose();
       terminalWidget = null;
       fitAddon = null;
-      unlistenTerminal?.();
-      unlistenFocusSession?.();
+      clearUiListeners();
     };
   });
 </script>
