@@ -194,14 +194,6 @@
 
   type UnlistenFn = () => void;
 
-  type AgentListItem = {
-    agent: AgentRow;
-    session: SessionRuntime | null;
-    status: SessionRuntime["status"] | "idle";
-    isRunning: boolean;
-    lastSeen: string;
-  };
-
   type PaletteCommandId = "show-unresolved-inputs" | "voice-query-input-needed";
 
   type PaletteCommand = {
@@ -217,6 +209,13 @@
         label: string;
         meta: string;
         commandId: PaletteCommandId;
+      }
+    | {
+        id: string;
+        kind: "session";
+        label: string;
+        meta: string;
+        sessionId: number;
       }
     | {
         id: string;
@@ -255,7 +254,6 @@
   let attachedSessionId = $state<number | null>(null);
   let terminalInput = $state<string>("");
   let terminalContainer: HTMLDivElement | null = $state(null);
-  let showClosedAgents = $state<boolean>(false);
   let showCommandPalette = $state<boolean>(false);
   let paletteQuery = $state<string>("");
   let paletteSelectedIndex = $state<number>(0);
@@ -298,6 +296,9 @@
   const ALERT_TOAST_MAX = 4;
   const ALERT_TOAST_TTL_MS = 8000;
   const RUNTIME_ISSUE_MAX = 6;
+  const UI_SNIPPET_MAX_CHARS = 180;
+  const UI_RUNTIME_ISSUE_MAX_CHARS = 240;
+  const UI_VOICE_LINE_MAX_CHARS = 220;
   const RUNTIME_ISSUE_MIC_PATTERNS = [
     "microphone",
     "audio device",
@@ -378,50 +379,6 @@
     sessions.filter((session) => isActiveSessionStatus(session.status))
   );
 
-  const latestSessionByAgent = $derived(
-    (() => {
-      const map = new Map<number, SessionRuntime>();
-      for (const session of sessions) {
-        if (session.agentId === null || session.agentId === undefined) continue;
-        if (!map.has(session.agentId)) {
-          map.set(session.agentId, session);
-        }
-      }
-      return map;
-    })()
-  );
-
-  const agentListItems = $derived<AgentListItem[]>(
-    agents
-      .map((agent) => {
-        const activeSession = agent.activeSessionId
-          ? sessions.find((session) => session.id === agent.activeSessionId) ?? null
-          : null;
-        const session = activeSession ?? latestSessionByAgent.get(agent.id) ?? null;
-        const status: SessionRuntime["status"] | "idle" = session?.status ?? "idle";
-        const isRunning = status !== "ended" && status !== "failed" && status !== "idle";
-        const lastSeen = formatRelativeTime(
-          session?.lastActivityAt ?? session?.updatedAt ?? agent.lastActivityAt ?? agent.updatedAt
-        );
-
-        return {
-          agent,
-          session,
-          status,
-          isRunning,
-          lastSeen
-        };
-      })
-      .sort((a, b) => {
-        if (a.isRunning !== b.isRunning) return a.isRunning ? -1 : 1;
-        return a.agent.displayOrder - b.agent.displayOrder;
-      })
-  );
-
-  const visibleAgentListItems = $derived<AgentListItem[]>(
-    agentListItems.filter((item) => showClosedAgents || item.isRunning)
-  );
-
   const activeRuntimeIssues = $derived(
     [...runtimeIssues].sort((left, right) => {
       if (left.severity !== right.severity) {
@@ -458,7 +415,8 @@
       ...agent,
       updatedAt: formatRelativeTime(agent.updatedAt),
       lastActivityAt: formatRelativeTime(agent.lastActivityAt ?? agent.updatedAt),
-      lastInputRequiredAt: formatRelativeTime(agent.lastInputRequiredAt ?? null)
+      lastInputRequiredAt: formatRelativeTime(agent.lastInputRequiredAt ?? null),
+      lastSnippet: sanitizeOptionalText(agent.lastSnippet ?? null, UI_SNIPPET_MAX_CHARS)
     }));
   };
 
@@ -472,16 +430,62 @@
   const includesAnyPattern = (value: string, patterns: string[]) =>
     patterns.some((pattern) => value.includes(pattern));
 
+  const sanitizeDisplayText = (value: unknown, maxChars = UI_VOICE_LINE_MAX_CHARS) => {
+    if (value === null || value === undefined) return "";
+    const text = String(value)
+      .replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "")
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text) return "";
+    if (text.length <= maxChars) return text;
+    if (maxChars <= 1) return "…";
+    return `${text.slice(0, maxChars - 1)}…`;
+  };
+
+  const sanitizeOptionalText = (value: string | null | undefined, maxChars: number) => {
+    if (!value) return null;
+    const cleaned = sanitizeDisplayText(value, maxChars);
+    return cleaned || null;
+  };
+
+  const summarizeVoiceIntent = (event: VoiceIntentEvent) => {
+    const agentIndex = event.payload?.agent_index;
+    const agentHint = event.payload?.agent_name_hint;
+    const input = event.payload?.input;
+    const command = event.payload?.command;
+    const parts: string[] = [event.action];
+
+    if (typeof agentIndex === "number" && Number.isFinite(agentIndex)) {
+      parts.push(`agent ${agentIndex}`);
+    } else if (typeof agentHint === "string" && agentHint.trim()) {
+      parts.push(`agent ${sanitizeDisplayText(agentHint, 40)}`);
+    }
+
+    if (typeof command === "string" && command.trim()) {
+      parts.push(`cmd ${sanitizeDisplayText(command, 80)}`);
+    }
+    if (typeof input === "string" && input.trim()) {
+      parts.push(`input ${sanitizeDisplayText(input, 80)}`);
+    }
+
+    return sanitizeDisplayText(parts.join(" · "), UI_VOICE_LINE_MAX_CHARS);
+  };
+
   const normalizeErrorMessage = (error: unknown) => {
-    if (typeof error === "string") return error;
+    if (typeof error === "string") {
+      return sanitizeDisplayText(error, UI_RUNTIME_ISSUE_MAX_CHARS);
+    }
     if (error && typeof error === "object" && "message" in error) {
       const maybeMessage = (error as { message?: unknown }).message;
-      if (typeof maybeMessage === "string") return maybeMessage;
+      if (typeof maybeMessage === "string") {
+        return sanitizeDisplayText(maybeMessage, UI_RUNTIME_ISSUE_MAX_CHARS);
+      }
     }
     try {
-      return JSON.stringify(error);
+      return sanitizeDisplayText(JSON.stringify(error), UI_RUNTIME_ISSUE_MAX_CHARS);
     } catch {
-      return String(error);
+      return sanitizeDisplayText(String(error), UI_RUNTIME_ISSUE_MAX_CHARS);
     }
   };
 
@@ -660,13 +664,16 @@
         activeSessionInputReason: row.activeSessionInputReason ?? null,
         unresolvedAlertCount: row.unresolvedAlertCount ?? 0,
         lastActivityAt: row.lastActivityAt ?? null,
-        lastSnippet: row.lastSnippet ?? null,
+        lastSnippet: sanitizeOptionalText(row.lastSnippet ?? null, UI_SNIPPET_MAX_CHARS),
         updatedAt: row.updatedAt
       }));
 
       applyRelativeTimes(mappedAgents);
       sessions = sessionsResponse as SessionRuntime[];
-      unresolvedAlerts = alertsResponse as SessionAlert[];
+      unresolvedAlerts = (alertsResponse as SessionAlert[]).map((alert) => ({
+        ...alert,
+        message: sanitizeDisplayText(alert.message, UI_SNIPPET_MAX_CHARS)
+      }));
 
       if (agents.length > 0 && !agents.some((agent) => agent.id === selectedAgentId)) {
         selectedAgentId = agents[0].id;
@@ -759,6 +766,32 @@
       commandId: command.id
     }));
 
+    const sessionsForPalette = [...activeSessions];
+    if (
+      selectedSession &&
+      !sessionsForPalette.some((session) => session.id === selectedSession.id)
+    ) {
+      sessionsForPalette.unshift(selectedSession);
+    }
+
+    const sessionEntries = sessionsForPalette
+      .filter((session) => {
+        if (!query) return true;
+        const agentName = lookupAgentName(session.agentId);
+        const haystack =
+          `session ${session.id} ${session.status} ${session.launchCommand} ${agentName}`.toLowerCase();
+        return haystack.includes(query);
+      })
+      .map((session) => ({
+        id: `session-${session.id}`,
+        kind: "session" as const,
+        label: `Session #${session.id} · ${lookupAgentName(session.agentId)}`,
+        meta: `${toTitleCase(session.status)} · ${session.launchCommand} · ${formatRelativeTime(
+          session.lastActivityAt ?? session.updatedAt
+        )}`,
+        sessionId: session.id
+      }));
+
     const alerts = unresolvedAlerts
       .filter((alert) => {
         if (!query) return true;
@@ -775,7 +808,7 @@
         alert
       }));
 
-    return [...commands, ...alerts];
+    return [...commands, ...sessionEntries, ...alerts];
   });
 
   $effect(() => {
@@ -793,7 +826,10 @@
         unresolvedOnly: true,
         limit: 200
       })) as SessionAlert[];
-      unresolvedAlerts = alerts;
+      unresolvedAlerts = alerts.map((alert) => ({
+        ...alert,
+        message: sanitizeDisplayText(alert.message, UI_SNIPPET_MAX_CHARS)
+      }));
     } catch (error) {
       console.error("Failed to load unresolved alerts", error);
       unresolvedAlerts = [];
@@ -818,7 +854,7 @@
       agentId: payload.agentId ?? null,
       severity: payload.severity,
       reason: payload.reason,
-      message: payload.message,
+      message: sanitizeDisplayText(payload.message, UI_SNIPPET_MAX_CHARS),
       requiresAck: payload.requiresAck,
       acknowledgedAt: null,
       snoozedUntil: null,
@@ -843,7 +879,7 @@
       agentId: payload.agentId ?? null,
       severity: payload.severity,
       reason: payload.reason,
-      message: payload.message
+      message: sanitizeDisplayText(payload.message, UI_SNIPPET_MAX_CHARS)
     };
 
     const nextToasts = [toast, ...alertToasts];
@@ -908,6 +944,11 @@
     if (!entry) return;
     if (entry.kind === "command") {
       await runPaletteCommand(entry.commandId);
+      return;
+    }
+    if (entry.kind === "session") {
+      closeCommandPalette();
+      await focusSession(entry.sessionId);
       return;
     }
     closeCommandPalette();
@@ -1259,7 +1300,10 @@
         .then((status) => {
           const typed = status as VoiceStatus;
           voiceState = typed.state;
-          lastTranscript = typed.lastTranscript ?? lastTranscript;
+          lastTranscript = sanitizeDisplayText(
+            typed.lastTranscript ?? lastTranscript,
+            UI_VOICE_LINE_MAX_CHARS
+          );
         })
         .catch((error) => {
           console.error("Failed to refresh voice status", error);
@@ -1392,26 +1436,38 @@
         }),
         listen("voice_transcript", (event) => {
           const payload = event.payload as { text: string };
-          lastTranscript = payload.text;
+          lastTranscript = sanitizeDisplayText(payload.text, UI_VOICE_LINE_MAX_CHARS);
           lastVoiceCommandText = payload.text;
         }),
         listen("voice_intent", (event) => {
           const payload = event.payload as VoiceIntentEvent;
-          lastIntent = `${payload.action} ${JSON.stringify(payload.payload)}`;
+          lastIntent = summarizeVoiceIntent(payload);
         }),
         listen("voice_action_executed", (event) => {
           const payload = event.payload as VoiceAction;
-          lastCommand = `${payload.action} (${payload.result})`;
+          const actionText = sanitizeDisplayText(payload.action, 40);
+          const resultText = sanitizeDisplayText(payload.result, 24);
+          const detail =
+            typeof payload.text === "string" && payload.text.trim()
+              ? `: ${sanitizeDisplayText(payload.text, 90)}`
+              : "";
+          lastCommand = sanitizeDisplayText(
+            `${actionText} (${resultText})${detail}`,
+            UI_VOICE_LINE_MAX_CHARS
+          );
           void loadData({ background: true });
         }),
         listen("voice_error", (event) => {
           const payload = event.payload as { message: string };
-          lastCommand = `error: ${payload.message}`;
+          lastCommand = sanitizeDisplayText(
+            `error: ${payload.message}`,
+            UI_VOICE_LINE_MAX_CHARS
+          );
           reportRuntimeIssue({ error: payload.message, source: "voice" });
         }),
         listen("voice_status_reply", (event) => {
           const payload = event.payload as VoiceStatusReplyEvent;
-          lastCommand = payload.summary;
+          lastCommand = sanitizeDisplayText(payload.summary, UI_VOICE_LINE_MAX_CHARS);
         })
       ]);
       listenerReconnectAttempts = 0;
@@ -1474,7 +1530,10 @@
       .then((status) => {
         const typed = status as VoiceStatus;
         voiceState = typed.state;
-        lastTranscript = typed.lastTranscript ?? "";
+        lastTranscript = sanitizeDisplayText(
+          typed.lastTranscript ?? "",
+          UI_VOICE_LINE_MAX_CHARS
+        );
       })
       .catch((error) => {
         console.error("Failed to get voice status", error);
@@ -1590,10 +1649,21 @@
 
   <section class="workspace">
     <section class="terminals-pane">
-      <header class="pane-header">
-        <h1>Current terminals</h1>
+      <header class="pane-header terminal-header">
+        <div class="terminal-title-block">
+          <h1>Terminal</h1>
+          <p>
+            {#if selectedSession}
+              Session #{selectedSession.id} · {lookupAgentName(selectedSession.agentId)}
+            {:else}
+              No session selected
+            {/if}
+          </p>
+        </div>
         <div class="pane-header-actions">
-          <span>{activeSessions.length}</span>
+          <button class="ghost compact" onclick={() => void openCommandPalette()}>
+            Sessions (Cmd/Ctrl+K)
+          </button>
           <button
             class="primary"
             onclick={() => startSession(selectedAgent?.id, selectedAgent?.taskId ?? undefined)}
@@ -1604,24 +1674,18 @@
         </div>
       </header>
 
-      <div class="terminal-session-list">
-        {#if activeSessions.length === 0}
-          <p class="empty-state">No active sessions right now.</p>
+      <div class="current-agent-strip" aria-label="Current agent">
+        {#if selectedAgent}
+          <strong>{selectedAgent.name}</strong>
+          <span>{selectedAgent.provider}</span>
+          <span class={`status ${selectedAgent.activeSessionStatus ?? selectedAgent.state}`}>
+            {toTitleCase(selectedAgent.activeSessionStatus ?? selectedAgent.state)}
+          </span>
+          <span>
+            Task: {selectedAgent.taskTitle ?? "Unassigned"}
+          </span>
         {:else}
-          {#each activeSessions as session}
-            <button
-              class="session-card"
-              class:selected={session.id === selectedSessionId}
-              onclick={() => focusSession(session.id)}
-            >
-              <div class="session-card-head">
-                <strong>Session #{session.id}</strong>
-                <span class={`status ${session.status}`}>{toTitleCase(session.status)}</span>
-              </div>
-              <p>{lookupAgentName(session.agentId)} · {session.launchCommand}</p>
-              <p>Last activity: {formatRelativeTime(session.lastActivityAt ?? session.updatedAt)}</p>
-            </button>
-          {/each}
+          <span>No focused agent</span>
         {/if}
       </div>
 
@@ -1658,45 +1722,33 @@
 
     <aside class="activity-pane">
       <header class="pane-header">
-        <h2>Agents</h2>
+        <h2>Current agent</h2>
         <div class="pane-header-actions">
-          <span>{visibleAgentListItems.length}</span>
-          <button class="ghost" onclick={() => (showClosedAgents = !showClosedAgents)}>
-            {showClosedAgents ? "Hide closed" : "Show closed"}
-          </button>
+          <span>{unresolvedAlerts.length} alerts</span>
         </div>
       </header>
 
-      <div class="activity-list">
-        {#if visibleAgentListItems.length === 0}
-          <p class="empty-state">No running agents right now.</p>
+      <section class="current-agent-panel">
+        {#if selectedAgent}
+          <h3>{selectedAgent.name}</h3>
+          <p>{selectedAgent.provider} · {toTitleCase(selectedAgent.attentionState)}</p>
+          <p>Task: {selectedAgent.taskTitle ?? "Unassigned"}</p>
+          <p>
+            Session:
+            {#if selectedSession}
+              #{selectedSession.id} · {toTitleCase(selectedSession.status)}
+            {:else}
+              none
+            {/if}
+          </p>
+          <p>Last activity: {selectedAgent.lastActivityAt ?? selectedAgent.updatedAt}</p>
         {:else}
-          {#each visibleAgentListItems as item (item.agent.id)}
-            <article class="activity-item">
-              <div class="agent-item-head">
-                <p class="activity-title">{item.agent.name}</p>
-                <span class={`status status-pill ${item.status}`}>{toTitleCase(item.status)}</span>
-              </div>
-              <p class="activity-meta">Last seen: {item.lastSeen}</p>
-              {#if item.session}
-                <p class="activity-message">
-                  Session #{item.session.id} · {item.session.launchCommand}
-                </p>
-                <div class="activity-actions">
-                  <button class="ghost" onclick={() => focusAgentById(item.agent.id, item.session?.id)}>
-                    Open
-                  </button>
-                </div>
-              {:else}
-                <p class="activity-message">No sessions yet.</p>
-              {/if}
-            </article>
-          {/each}
+          <p class="empty-state">No focused agent.</p>
         {/if}
-      </div>
+      </section>
 
-      <section class="alerts-panel" aria-label="Unresolved input alerts">
-        <header class="alerts-panel-header">
+      <section class="alerts-summary-panel" aria-label="Unresolved input alerts">
+        <header class="alerts-summary-header">
           <h3>Input alerts</h3>
           <span>{unresolvedAlerts.length}</span>
         </header>
@@ -1705,49 +1757,35 @@
         {:else if unresolvedAlerts.length === 0}
           <p class="empty-state">No unresolved input alerts.</p>
         {:else}
-          <div class="alerts-list">
-            {#each unresolvedAlerts.slice(0, 6) as alert (alert.id)}
-              <article class={`alert-item severity-${alert.severity.toLowerCase()}`}>
-                <button
-                  class="alert-open"
-                  onclick={() => {
-                    if (alert.agentId) {
-                      focusAgentById(alert.agentId, alert.sessionId);
-                    } else {
-                      void focusSession(alert.sessionId);
-                    }
-                  }}
-                >
-                  <strong>{lookupAgentName(alert.agentId)} · {toTitleCase(alert.reason)}</strong>
-                  <p>Session #{alert.sessionId} · {toTitleCase(alert.severity)}</p>
-                  <p>{alert.message}</p>
-                </button>
-                <div class="alert-item-actions">
-                  <button
-                    class="ghost compact"
-                    onclick={() => void runAlertAction("acknowledge", alert.id)}
-                    disabled={alertActionBusyId !== null || !!alert.acknowledgedAt}
-                  >
-                    {alert.acknowledgedAt ? "Acked" : "Acknowledge"}
-                  </button>
-                  <button
-                    class="ghost compact"
-                    onclick={() => void runAlertAction("snooze", alert.id)}
-                    disabled={alertActionBusyId !== null}
-                  >
-                    Snooze 30m
-                  </button>
-                  <button
-                    class="ghost compact"
-                    onclick={() => void runAlertAction("escalate", alert.id)}
-                    disabled={alertActionBusyId !== null || alert.severity.toLowerCase() === "critical"}
-                  >
-                    {alert.severity.toLowerCase() === "critical" ? "Escalated" : "Escalate"}
-                  </button>
-                </div>
-              </article>
-            {/each}
-          </div>
+          {@const latestAlert = unresolvedAlerts[0]}
+          <article class={`alert-item severity-${latestAlert.severity.toLowerCase()}`}>
+            <button
+              class="alert-open"
+              onclick={() => {
+                if (latestAlert.agentId) {
+                  focusAgentById(latestAlert.agentId, latestAlert.sessionId);
+                } else {
+                  void focusSession(latestAlert.sessionId);
+                }
+              }}
+            >
+              <strong>{lookupAgentName(latestAlert.agentId)} · {toTitleCase(latestAlert.reason)}</strong>
+              <p>Session #{latestAlert.sessionId} · {toTitleCase(latestAlert.severity)}</p>
+              <p>{latestAlert.message}</p>
+            </button>
+            <div class="alert-item-actions">
+              <button
+                class="ghost compact"
+                onclick={() => void runAlertAction("acknowledge", latestAlert.id)}
+                disabled={alertActionBusyId !== null || !!latestAlert.acknowledgedAt}
+              >
+                {latestAlert.acknowledgedAt ? "Acked" : "Acknowledge"}
+              </button>
+              <button class="ghost compact" onclick={() => void openCommandPalette()}>
+                Open palette
+              </button>
+            </div>
+          </article>
         {/if}
       </section>
     </aside>
@@ -1793,7 +1831,7 @@
           <input
             bind:this={paletteInput}
             bind:value={paletteQuery}
-            placeholder="Search commands or unresolved alerts"
+            placeholder="Search commands, sessions, or alerts"
             oninput={() => {
               paletteSelectedIndex = 0;
             }}
@@ -1819,7 +1857,9 @@
                   <strong>{entry.label}</strong>
                   <p>{entry.meta}</p>
                 </div>
-                <span class="command-palette-kind">{entry.kind === "command" ? "Command" : "Alert"}</span>
+                <span class="command-palette-kind">
+                  {entry.kind === "command" ? "Command" : entry.kind === "session" ? "Session" : "Alert"}
+                </span>
               </button>
             {/each}
           {/if}
@@ -1839,9 +1879,9 @@
     height: 100%;
     margin: 0;
     overflow: hidden;
-    background: #0b1118;
-    color: #dde7ef;
-    font-family: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+    background: #07080a;
+    color: #d6dde6;
+    font-family: "JetBrains Mono", "SFMono-Regular", "Menlo", monospace;
   }
 
   * {
@@ -1855,8 +1895,10 @@
     flex-direction: column;
     gap: 12px;
     overflow: hidden;
-    background-image: radial-gradient(circle at 12% 10%, rgba(47, 212, 195, 0.12), transparent 34%),
-      radial-gradient(circle at 92% 2%, rgba(255, 184, 92, 0.12), transparent 36%);
+    background-color: #07080a;
+    background-image: linear-gradient(rgba(145, 168, 190, 0.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(145, 168, 190, 0.03) 1px, transparent 1px);
+    background-size: 100% 3px, 3px 100%;
   }
 
   .alert-toast-stack {
@@ -1870,9 +1912,9 @@
   }
 
   .alert-toast {
-    border-radius: 12px;
-    border: 1px solid rgba(124, 157, 189, 0.38);
-    background: rgba(8, 15, 24, 0.96);
+    border-radius: 6px;
+    border: 1px solid rgba(118, 138, 162, 0.38);
+    background: rgba(7, 10, 15, 0.96);
     box-shadow: 0 14px 28px rgba(0, 0, 0, 0.35);
     padding: 10px;
     display: grid;
@@ -1920,8 +1962,8 @@
 
   .runtime-issues-panel {
     border: 1px solid rgba(255, 123, 114, 0.46);
-    border-radius: 12px;
-    background: rgba(31, 12, 14, 0.9);
+    border-radius: 6px;
+    background: rgba(32, 14, 16, 0.88);
     padding: 10px;
     display: grid;
     gap: 8px;
@@ -1954,7 +1996,7 @@
   }
 
   .runtime-issue {
-    border-radius: 10px;
+    border-radius: 6px;
     border: 1px solid rgba(255, 123, 114, 0.5);
     background: rgba(43, 14, 17, 0.74);
     padding: 8px;
@@ -2000,27 +2042,25 @@
     min-height: 0;
     overflow: hidden;
     display: grid;
-    grid-template-columns: minmax(560px, 1.9fr) minmax(280px, 1fr);
+    grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
     gap: 12px;
   }
 
   .terminals-pane,
   .activity-pane {
     min-height: 0;
-    background: rgba(8, 14, 22, 0.88);
-    border: 1px solid rgba(132, 162, 194, 0.25);
-    border-radius: 14px;
+    background: rgba(5, 8, 12, 0.95);
+    border: 1px solid rgba(118, 138, 162, 0.32);
+    border-radius: 8px;
     padding: 12px;
     display: flex;
     flex-direction: column;
     gap: 10px;
-    backdrop-filter: blur(12px);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
   }
 
   .activity-pane {
-    background: linear-gradient(180deg, rgba(10, 18, 28, 0.94) 0%, rgba(8, 14, 22, 0.94) 100%);
-    border-color: rgba(127, 164, 202, 0.36);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    gap: 12px;
   }
 
   .pane-header {
@@ -2033,16 +2073,17 @@
   .pane-header h1,
   .pane-header h2 {
     margin: 0;
-    font-size: 16px;
-    letter-spacing: 0.04em;
+    font-size: 13px;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
+    color: rgba(214, 221, 230, 0.92);
   }
 
   .pane-header span {
-    font-size: 12px;
+    font-size: 11px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: rgba(221, 231, 239, 0.68);
+    color: rgba(214, 221, 230, 0.62);
   }
 
   .pane-header-actions {
@@ -2051,48 +2092,44 @@
     gap: 8px;
   }
 
-  .terminal-session-list {
-    display: grid;
-    gap: 8px;
-    max-height: 220px;
-    min-height: 110px;
-    overflow-y: auto;
-    padding-right: 4px;
+  .terminal-header {
+    align-items: flex-start;
   }
 
-  .session-card {
-    width: 100%;
-    border: 1px solid transparent;
-    background: rgba(16, 24, 34, 0.85);
-    border-radius: 12px;
-    padding: 10px;
-    color: inherit;
-    text-align: left;
-    cursor: pointer;
+  .terminal-title-block {
     display: grid;
     gap: 4px;
   }
 
-  .session-card:hover {
-    border-color: rgba(47, 212, 195, 0.45);
-  }
-
-  .session-card.selected {
-    border-color: rgba(47, 212, 195, 0.9);
-    background: rgba(19, 36, 48, 0.95);
-  }
-
-  .session-card-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .session-card p {
+  .terminal-title-block p {
     margin: 0;
-    font-size: 12px;
-    color: rgba(221, 231, 239, 0.78);
+    font-size: 11px;
+    color: rgba(214, 221, 230, 0.66);
+  }
+
+  .current-agent-strip {
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    font-size: 11px;
+    padding: 8px 10px;
+    border: 1px solid rgba(118, 138, 162, 0.3);
+    border-radius: 6px;
+    background: rgba(8, 11, 16, 0.9);
+    color: rgba(214, 221, 230, 0.75);
+  }
+
+  .current-agent-strip strong {
+    color: rgba(229, 236, 245, 0.96);
+  }
+
+  .current-agent-strip .status {
+    border: 1px solid rgba(118, 138, 162, 0.38);
+    border-radius: 4px;
+    padding: 1px 6px;
+    background: rgba(16, 20, 29, 0.85);
   }
 
   .terminal-view {
@@ -2108,8 +2145,8 @@
     justify-content: space-between;
     align-items: center;
     gap: 10px;
-    font-size: 13px;
-    color: rgba(221, 231, 239, 0.88);
+    font-size: 12px;
+    color: rgba(214, 221, 230, 0.82);
   }
 
   .terminal-view-actions {
@@ -2120,11 +2157,11 @@
 
   .terminal-widget {
     flex: 1;
-    min-height: 300px;
+    min-height: 420px;
     overflow: hidden;
-    background: #060b12;
-    border: 1px solid rgba(123, 161, 199, 0.3);
-    border-radius: 12px;
+    background: #020304;
+    border: 1px solid rgba(118, 138, 162, 0.35);
+    border-radius: 8px;
     padding: 0;
   }
 
@@ -2139,133 +2176,63 @@
     gap: 8px;
   }
 
-  .terminal-input-row input,
-  .voice-input input {
-    border: 1px solid rgba(123, 161, 199, 0.45);
-    border-radius: 10px;
-    padding: 10px 12px;
-    background: rgba(11, 19, 29, 0.95);
-    color: inherit;
-  }
-
-  .activity-list {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
+  .current-agent-panel,
+  .alerts-summary-panel {
+    border: 1px solid rgba(118, 138, 162, 0.3);
+    border-radius: 6px;
+    background: rgba(8, 11, 16, 0.9);
+    padding: 10px;
     display: grid;
-    grid-template-columns: 1fr;
-    grid-auto-rows: 120px;
-    align-content: start;
-    gap: 8px;
-    padding-right: 4px;
-  }
-
-  .activity-item {
-    height: 120px;
-    border-radius: 12px;
-    padding: 10px 11px;
-    background: linear-gradient(165deg, rgba(17, 28, 41, 0.96) 0%, rgba(12, 20, 31, 0.96) 100%);
-    border: 1px solid rgba(122, 155, 187, 0.34);
-    display: flex;
-    flex-direction: column;
     gap: 6px;
-    overflow: hidden;
-    transition: border-color 140ms ease, transform 140ms ease, box-shadow 140ms ease;
   }
 
-  .activity-item:hover {
-    border-color: rgba(47, 212, 195, 0.56);
-    transform: translateY(-1px);
-    box-shadow: 0 6px 14px rgba(3, 10, 18, 0.35);
-  }
-
-  .agent-item-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 8px;
-    min-height: 22px;
-  }
-
-  .activity-title,
-  .activity-meta,
-  .activity-message {
+  .current-agent-panel h3,
+  .current-agent-panel p {
     margin: 0;
   }
 
-  .activity-title {
+  .current-agent-panel h3 {
     font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 0.01em;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    color: rgba(229, 236, 245, 0.96);
   }
 
-  .activity-meta {
+  .current-agent-panel p {
     font-size: 11px;
-    color: rgba(221, 231, 239, 0.7);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    color: rgba(214, 221, 230, 0.78);
   }
 
-  .activity-message {
-    font-size: 12px;
-    color: rgba(226, 235, 242, 0.9);
-    display: -webkit-box;
-    line-clamp: 1;
-    -webkit-line-clamp: 1;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-
-  .activity-actions {
-    display: flex;
-    gap: 8px;
-    margin-top: auto;
-  }
-
-  .alerts-panel {
-    border-top: 1px solid rgba(124, 157, 189, 0.26);
-    padding-top: 10px;
-    display: grid;
-    gap: 8px;
-  }
-
-  .alerts-panel-header {
+  .alerts-summary-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 8px;
   }
 
-  .alerts-panel-header h3 {
+  .alerts-summary-header h3 {
     margin: 0;
     font-size: 12px;
-    letter-spacing: 0.07em;
-    text-transform: uppercase;
-  }
-
-  .alerts-panel-header span {
-    font-size: 11px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: rgba(221, 231, 239, 0.7);
   }
 
-  .alerts-list {
-    max-height: 260px;
-    overflow-y: auto;
-    display: grid;
-    gap: 7px;
-    padding-right: 4px;
+  .alerts-summary-header span {
+    font-size: 11px;
+    color: rgba(214, 221, 230, 0.7);
+  }
+
+  .terminal-input-row input,
+  .voice-input input {
+    border: 1px solid rgba(118, 138, 162, 0.42);
+    border-radius: 6px;
+    padding: 10px 12px;
+    background: rgba(5, 8, 12, 0.92);
+    color: inherit;
   }
 
   .alert-item {
-    border-radius: 10px;
-    border: 1px solid rgba(124, 157, 189, 0.32);
-    background: rgba(12, 20, 31, 0.88);
+    border-radius: 6px;
+    border: 1px solid rgba(118, 138, 162, 0.32);
+    background: rgba(7, 10, 15, 0.9);
     padding: 8px;
     display: grid;
     gap: 8px;
@@ -2325,18 +2292,6 @@
     gap: 6px;
   }
 
-  .status-pill {
-    display: inline-flex;
-    align-items: center;
-    border-radius: 999px;
-    border: 1px solid rgba(128, 160, 190, 0.5);
-    background: rgba(15, 24, 35, 0.95);
-    padding: 2px 8px;
-    font-size: 10px;
-    letter-spacing: 0.06em;
-    white-space: nowrap;
-  }
-
   .command-palette-backdrop {
     position: fixed;
     inset: 0;
@@ -2354,10 +2309,10 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    border-radius: 14px;
-    border: 1px solid rgba(120, 160, 193, 0.38);
-    background: linear-gradient(180deg, rgba(10, 17, 27, 0.98) 0%, rgba(7, 12, 20, 0.98) 100%);
-    box-shadow: 0 26px 44px rgba(0, 0, 0, 0.45);
+    border-radius: 8px;
+    border: 1px solid rgba(118, 138, 162, 0.42);
+    background: rgba(7, 10, 15, 0.98);
+    box-shadow: 0 20px 34px rgba(0, 0, 0, 0.5);
     padding: 10px;
   }
 
@@ -2368,10 +2323,10 @@
   }
 
   .command-palette-header input {
-    border: 1px solid rgba(123, 161, 199, 0.55);
-    border-radius: 10px;
+    border: 1px solid rgba(118, 138, 162, 0.55);
+    border-radius: 6px;
     padding: 10px 12px;
-    background: rgba(11, 19, 29, 0.95);
+    background: rgba(5, 8, 12, 0.95);
     color: inherit;
     min-width: 0;
   }
@@ -2393,9 +2348,9 @@
 
   .command-palette-item {
     width: 100%;
-    border: 1px solid rgba(118, 152, 184, 0.32);
-    background: rgba(10, 17, 27, 0.82);
-    border-radius: 10px;
+    border: 1px solid rgba(118, 138, 162, 0.32);
+    background: rgba(8, 11, 16, 0.86);
+    border-radius: 6px;
     padding: 10px;
     color: inherit;
     text-align: left;
@@ -2406,8 +2361,8 @@
   }
 
   .command-palette-item.selected {
-    border-color: rgba(47, 212, 195, 0.86);
-    background: rgba(13, 35, 41, 0.9);
+    border-color: rgba(91, 213, 204, 0.8);
+    background: rgba(13, 25, 30, 0.9);
   }
 
   .command-palette-copy {
@@ -2434,14 +2389,14 @@
   }
 
   .command-palette-kind {
-    border: 1px solid rgba(127, 165, 198, 0.42);
-    border-radius: 999px;
+    border: 1px solid rgba(118, 138, 162, 0.45);
+    border-radius: 4px;
     font-size: 10px;
     letter-spacing: 0.05em;
     text-transform: uppercase;
     padding: 2px 8px;
     color: rgba(225, 236, 245, 0.85);
-    background: rgba(12, 22, 34, 0.9);
+    background: rgba(8, 11, 16, 0.92);
     flex-shrink: 0;
   }
 
@@ -2450,9 +2405,9 @@
     grid-template-columns: 1.3fr auto 1fr;
     gap: 10px;
     align-items: center;
-    background: rgba(6, 10, 16, 0.95);
-    border: 1px solid rgba(123, 161, 199, 0.32);
-    border-radius: 14px;
+    background: rgba(5, 8, 12, 0.95);
+    border: 1px solid rgba(118, 138, 162, 0.35);
+    border-radius: 8px;
     padding: 10px;
     position: sticky;
     bottom: 0;
@@ -2489,10 +2444,10 @@
   }
 
   button {
-    border: 1px solid rgba(118, 152, 184, 0.36);
-    border-radius: 10px;
+    border: 1px solid rgba(118, 138, 162, 0.4);
+    border-radius: 6px;
     padding: 8px 12px;
-    font-weight: 700;
+    font-weight: 600;
     cursor: pointer;
     font-size: 12px;
     transition: border-color 130ms ease, transform 130ms ease, opacity 130ms ease;
@@ -2508,8 +2463,8 @@
   }
 
   .ghost {
-    background: rgba(133, 161, 190, 0.2);
-    color: #e5edf4;
+    background: rgba(18, 24, 34, 0.92);
+    color: #dbe3eb;
   }
 
   button.compact {
@@ -2518,9 +2473,9 @@
   }
 
   .primary {
-    background: linear-gradient(180deg, #3ae0cd 0%, #2fd4c3 100%);
-    color: #042926;
-    border-color: rgba(47, 212, 195, 0.52);
+    background: linear-gradient(180deg, #82dd78 0%, #5abf74 100%);
+    color: #041a08;
+    border-color: rgba(96, 192, 116, 0.6);
   }
 
   .status {
@@ -2530,17 +2485,17 @@
   }
 
   .status.active {
-    color: #2fd4c3;
+    color: #71d5c9;
   }
 
   .status.waking,
   .status.stalled {
-    color: #ffb85c;
+    color: #d9b15f;
   }
 
   .status.needs_input,
   .status.failed {
-    color: #ff7b72;
+    color: #d98781;
   }
 
   .status.ended {
@@ -2549,29 +2504,6 @@
 
   .status.idle {
     color: rgba(221, 231, 239, 0.56);
-  }
-
-  .status-pill.active {
-    border-color: rgba(47, 212, 195, 0.6);
-    background: rgba(11, 44, 40, 0.8);
-  }
-
-  .status-pill.waking,
-  .status-pill.stalled {
-    border-color: rgba(255, 184, 92, 0.62);
-    background: rgba(58, 43, 20, 0.78);
-  }
-
-  .status-pill.needs_input,
-  .status-pill.failed {
-    border-color: rgba(255, 123, 114, 0.62);
-    background: rgba(58, 24, 22, 0.78);
-  }
-
-  .status-pill.ended,
-  .status-pill.idle {
-    border-color: rgba(160, 173, 186, 0.5);
-    background: rgba(31, 41, 51, 0.75);
   }
 
   .empty-state {
@@ -2607,12 +2539,5 @@
       flex: 1;
     }
 
-    .activity-list {
-      grid-auto-rows: 112px;
-    }
-
-    .activity-item {
-      height: 112px;
-    }
   }
 </style>

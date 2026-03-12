@@ -22,6 +22,7 @@ const OPENCODE_IDLE_INPUT_THRESHOLD: Duration = Duration::from_secs(2);
 const OPENCODE_IDLE_INPUT_REASON: &str = "idle_no_output";
 const OPENCODE_IDLE_INPUT_MESSAGE: &str = "Waiting for your input";
 const IDLE_INPUT_MONITOR_INTERVAL: Duration = Duration::from_millis(250);
+const TERMINAL_SNIPPET_MAX_CHARS: usize = 220;
 const PER_SESSION_OUTPUT_MAX_BYTES: usize = 200_000;
 const TARGET_ACTIVE_SESSION_CAPACITY: usize = 10;
 const TOTAL_OUTPUT_MEMORY_CAP_BYTES: usize =
@@ -321,9 +322,12 @@ impl TerminalManager {
                     Ok(0) => break,
                     Ok(n) => {
                         let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let preview = sanitize_terminal_preview(&text, TERMINAL_SNIPPET_MAX_CHARS);
                         {
-                            let mut stored = snippet_clone.lock().unwrap();
-                            *stored = text.clone();
+                            if !preview.is_empty() {
+                                let mut stored = snippet_clone.lock().unwrap();
+                                *stored = preview;
+                            }
                         }
                         let mut out = output_clone.lock().unwrap();
                         out.append(&text);
@@ -621,9 +625,13 @@ impl SessionSupervisor {
                     Ok(0) => break,
                     Ok(n) => {
                         let snippet = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let snippet_preview =
+                            sanitize_terminal_preview(&snippet, TERMINAL_SNIPPET_MAX_CHARS);
                         {
-                            let mut stored = last_snippet.lock().unwrap();
-                            *stored = snippet.clone();
+                            if !snippet_preview.is_empty() {
+                                let mut stored = last_snippet.lock().unwrap();
+                                *stored = snippet_preview.clone();
+                            }
                         }
                         let cursor = {
                             let mut out = output_for_reader.lock().unwrap();
@@ -709,15 +717,17 @@ impl SessionSupervisor {
                         }
 
                         if last_emit.elapsed() >= Duration::from_millis(250) {
-                            let snippet_for_db = snippet.clone();
-                            let db_write = db_for_reader.clone();
-                            tauri::async_runtime::spawn(async move {
-                                if let Some(agent_id) = agent_id {
-                                    let _ = db_write
-                                        .update_agent_snippet(agent_id, &snippet_for_db)
-                                        .await;
-                                }
-                            });
+                            let snippet_for_db = snippet_preview.clone();
+                            if !snippet_for_db.is_empty() {
+                                let db_write = db_for_reader.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    if let Some(agent_id) = agent_id {
+                                        let _ = db_write
+                                            .update_agent_snippet(agent_id, &snippet_for_db)
+                                            .await;
+                                    }
+                                });
+                            }
                             last_emit = Instant::now();
                         }
                     }
@@ -896,7 +906,10 @@ impl SessionSupervisor {
         let sessions = self.sessions.lock().unwrap();
         let handle = sessions.get(&session_id)?;
         let snippet = handle.last_snippet.lock().unwrap().clone();
-        Some(snippet)
+        Some(sanitize_terminal_preview(
+            &snippet,
+            TERMINAL_SNIPPET_MAX_CHARS,
+        ))
     }
 
     pub fn list_runtime_sessions(&self) -> Vec<i64> {
@@ -1122,6 +1135,97 @@ fn next_char_boundary(text: &str, idx: usize) -> usize {
         i += 1;
     }
     i.min(text.len())
+}
+
+fn sanitize_terminal_preview(input: &str, max_chars: usize) -> String {
+    if input.trim().is_empty() || max_chars == 0 {
+        return String::new();
+    }
+
+    let stripped = strip_ansi_sequences(input);
+    let mut normalized = String::with_capacity(stripped.len());
+    for ch in stripped.chars() {
+        if ch == '\n' || ch == '\r' || ch == '\t' {
+            normalized.push(' ');
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        normalized.push(ch);
+    }
+
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(collapsed.trim(), max_chars, true)
+}
+
+fn strip_ansi_sequences(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+
+        let Some(next) = chars.next() else {
+            break;
+        };
+        match next {
+            '[' => {
+                for seq_char in chars.by_ref() {
+                    if ('@'..='~').contains(&seq_char) {
+                        break;
+                    }
+                }
+            }
+            ']' => {
+                let mut prev = '\0';
+                for seq_char in chars.by_ref() {
+                    if seq_char == '\u{7}' || (prev == '\u{1b}' && seq_char == '\\') {
+                        break;
+                    }
+                    prev = seq_char;
+                }
+            }
+            'P' | '_' | '^' => {
+                let mut prev = '\0';
+                for seq_char in chars.by_ref() {
+                    if prev == '\u{1b}' && seq_char == '\\' {
+                        break;
+                    }
+                    prev = seq_char;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn truncate_chars(input: &str, max_chars: usize, keep_tail: bool) -> String {
+    if max_chars == 0 || input.is_empty() {
+        return String::new();
+    }
+    let count = input.chars().count();
+    if count <= max_chars {
+        return input.to_string();
+    }
+
+    if keep_tail {
+        if max_chars == 1 {
+            return "…".to_string();
+        }
+        let start = count.saturating_sub(max_chars.saturating_sub(1));
+        let tail = input.chars().skip(start).collect::<String>();
+        return format!("…{}", tail);
+    }
+
+    let head = input
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    format!("{}…", head)
 }
 
 async fn emit_runtime_events(app: &AppHandle, db: &Db, session_id: i64) {

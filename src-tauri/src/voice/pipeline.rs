@@ -5,7 +5,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager};
@@ -23,6 +23,8 @@ const WAKE_SCAN_MIN_RMS: f32 = 0.01;
 const COMMAND_MIN_VOICED_MS: u64 = 350;
 const COMMAND_SILENCE_STOP_MS: u64 = 900;
 const COMMAND_VAD_THRESHOLD: f32 = 0.015;
+const VOICE_SUMMARY_MAX_CHARS: usize = 220;
+const VOICE_SUMMARY_LLM_THRESHOLD_CHARS: usize = 280;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +87,11 @@ struct VoiceStatusReplyEvent {
     target_agent_id: Option<i64>,
     summary: String,
     at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaGenerateResponse {
+    response: String,
 }
 
 #[derive(Default)]
@@ -455,19 +462,25 @@ impl VoiceManager {
         match execution {
             Ok(result) => {
                 if should_emit_status_reply(&parsed.action, &result) {
-                    if let Some(summary) = build_spoken_status_summary(&parsed.action, &result) {
-                        if let Err(err) = tts::speak(&summary) {
-                            self.emit_error(app, format!("tts failed: {}", err))?;
+                    if let Some(raw_summary) = build_spoken_status_summary(&parsed.action, &result)
+                    {
+                        let summary =
+                            build_voice_summary_for_speech(&config.model_endpoint, &raw_summary)
+                                .await;
+                        if !summary.is_empty() {
+                            if let Err(err) = tts::speak(&summary) {
+                                self.emit_error(app, format!("tts failed: {}", err))?;
+                            }
+                            app.emit(
+                                "voice_status_reply",
+                                VoiceStatusReplyEvent {
+                                    request_type: status_request_type(&parsed.action, &result),
+                                    target_agent_id: target_agent_id_from_result(&result),
+                                    summary,
+                                    at: now_timestamp(),
+                                },
+                            )?;
                         }
-                        app.emit(
-                            "voice_status_reply",
-                            VoiceStatusReplyEvent {
-                                request_type: status_request_type(&parsed.action, &result),
-                                target_agent_id: target_agent_id_from_result(&result),
-                                summary,
-                                at: now_timestamp(),
-                            },
-                        )?;
                     }
                 }
                 let execution_event = build_voice_action_executed_event(
@@ -482,6 +495,7 @@ impl VoiceManager {
                 Ok(result)
             }
             Err(err) => {
+                let err_text = err.to_string();
                 let error_result = serde_json::json!({ "error": err.to_string() });
                 let execution_event = build_voice_action_executed_event(
                     &parsed.action,
@@ -497,7 +511,26 @@ impl VoiceManager {
                     &parsed.payload,
                     &error_result,
                 );
-                self.emit_error(app, err.to_string())?;
+                let spoken_error =
+                    build_voice_summary_for_speech(&config.model_endpoint, &err_text).await;
+                if !spoken_error.is_empty() {
+                    if let Err(tts_err) = tts::speak(&spoken_error) {
+                        self.emit_error(app, format!("tts failed: {}", tts_err))?;
+                    }
+                    app.emit(
+                        "voice_status_reply",
+                        VoiceStatusReplyEvent {
+                            request_type: "error".to_string(),
+                            target_agent_id: target_agent_id_from_result(&error_result),
+                            summary: spoken_error,
+                            at: now_timestamp(),
+                        },
+                    )?;
+                }
+                self.emit_error(
+                    app,
+                    sanitize_display_text(&err_text, VOICE_SUMMARY_MAX_CHARS),
+                )?;
                 self.set_state(app, VoiceRuntimeState::Listening)?;
                 Err(err)
             }
@@ -567,7 +600,7 @@ fn build_voice_action_executed_event(
         text: payload
             .get("input")
             .and_then(|value| value.as_str())
-            .map(ToString::to_string),
+            .map(|value| sanitize_display_text(value, 120)),
         result: outcome.to_string(),
         at: now_timestamp(),
     }
@@ -700,6 +733,153 @@ fn build_input_needed_loop_summary(agent_count: usize, alert_count: usize) -> Op
     ))
 }
 
+async fn build_voice_summary_for_speech(model_endpoint: &str, raw_text: &str) -> String {
+    let cleaned = sanitize_display_text(
+        raw_text,
+        VOICE_SUMMARY_LLM_THRESHOLD_CHARS.saturating_mul(4),
+    );
+    if cleaned.is_empty() {
+        return String::new();
+    }
+
+    if should_use_llm_summary(&cleaned) {
+        if let Ok(summary) = summarize_with_llm(model_endpoint, &cleaned).await {
+            let normalized = sanitize_display_text(&summary, VOICE_SUMMARY_MAX_CHARS);
+            if !normalized.is_empty() {
+                return normalized;
+            }
+        }
+    }
+
+    sanitize_display_text(&cleaned, VOICE_SUMMARY_MAX_CHARS)
+}
+
+async fn summarize_with_llm(model_endpoint: &str, text: &str) -> Result<String> {
+    let endpoint = if model_endpoint.contains("/api/") {
+        model_endpoint.to_string()
+    } else {
+        format!("{}/api/generate", model_endpoint.trim_end_matches('/'))
+    };
+
+    let prompt = format!(
+        "Summarize this runtime output for voice playback in one short sentence (max 25 words). Focus on user action and omit terminal noise.\nText: {}",
+        text
+    );
+
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .json(&serde_json::json!({
+            "model": "llama3.2",
+            "stream": false,
+            "prompt": prompt,
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let body: OllamaGenerateResponse = response.json().await?;
+    Ok(body.response)
+}
+
+fn should_use_llm_summary(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let noisy_patterns = [
+        "traceback",
+        "stack trace",
+        "stderr",
+        "stdout",
+        "exception",
+        "failed",
+        "error:",
+        "input:",
+    ];
+
+    text.chars().count() > VOICE_SUMMARY_LLM_THRESHOLD_CHARS
+        || noisy_patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn sanitize_display_text(raw: &str, max_chars: usize) -> String {
+    if raw.trim().is_empty() || max_chars == 0 {
+        return String::new();
+    }
+
+    let stripped = strip_ansi_sequences(raw);
+    let mut normalized = String::with_capacity(stripped.len());
+    for ch in stripped.chars() {
+        if ch == '\n' || ch == '\r' || ch == '\t' {
+            normalized.push(' ');
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        normalized.push(ch);
+    }
+
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(collapsed.trim(), max_chars)
+}
+
+fn strip_ansi_sequences(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+
+        let Some(next) = chars.next() else {
+            break;
+        };
+        match next {
+            '[' => {
+                for seq_char in chars.by_ref() {
+                    if ('@'..='~').contains(&seq_char) {
+                        break;
+                    }
+                }
+            }
+            ']' => {
+                let mut prev = '\0';
+                for seq_char in chars.by_ref() {
+                    if seq_char == '\u{7}' || (prev == '\u{1b}' && seq_char == '\\') {
+                        break;
+                    }
+                    prev = seq_char;
+                }
+            }
+            'P' | '_' | '^' => {
+                let mut prev = '\0';
+                for seq_char in chars.by_ref() {
+                    if prev == '\u{1b}' && seq_char == '\\' {
+                        break;
+                    }
+                    prev = seq_char;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 || input.is_empty() {
+        return String::new();
+    }
+    let count = input.chars().count();
+    if count <= max_chars {
+        return input.to_string();
+    }
+
+    let head = input
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    format!("{}…", head)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,5 +951,25 @@ mod tests {
     #[test]
     fn input_needed_loop_summary_skips_when_none_need_input() {
         assert!(build_input_needed_loop_summary(0, 0).is_none());
+    }
+
+    #[test]
+    fn sanitize_display_text_removes_ansi_and_control_chars() {
+        let value = sanitize_display_text("\u{1b}[31mfailed\u{1b}[0m\tline\0", 64);
+        assert_eq!(value, "failed line");
+    }
+
+    #[test]
+    fn sanitize_display_text_truncates_long_messages() {
+        let value = sanitize_display_text("1234567890abcdef", 8);
+        assert_eq!(value, "1234567…");
+    }
+
+    #[test]
+    fn llm_summary_heuristic_uses_noise_and_length() {
+        assert!(should_use_llm_summary(
+            "error: terminal session output too verbose"
+        ));
+        assert!(!should_use_llm_summary("agent is active"));
     }
 }

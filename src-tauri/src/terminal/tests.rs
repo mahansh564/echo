@@ -319,3 +319,17 @@ fn session_output_buffer_chunk_handles_cursor_before_trimmed_window() {
     assert_eq!(next, 10);
     assert!(has_more);
 }
+
+#[test]
+fn sanitize_terminal_preview_strips_ansi_and_control_noise() {
+    let raw = "\u{1b}[31mERROR\u{1b}[0m \r\n\tline\0";
+    let cleaned = sanitize_terminal_preview(raw, 64);
+    assert_eq!(cleaned, "ERROR line");
+}
+
+#[test]
+fn sanitize_terminal_preview_keeps_recent_tail_when_too_long() {
+    let cleaned = sanitize_terminal_preview("prefix very long line with important tail", 12);
+    assert!(cleaned.starts_with('…'));
+    assert!(cleaned.ends_with("rtant tail"));
+}
