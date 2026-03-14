@@ -1,7 +1,7 @@
 pub mod models;
 
 use anyhow::{anyhow, Result};
-use models::{AgentRow, ManagedSession, SessionAlert, SessionEvent, Task};
+use models::{AgentRow, ManagedSession, RuntimeIssue, SessionAlert, SessionEvent, Task};
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Sqlite, SqlitePool};
@@ -14,7 +14,15 @@ pub struct Db {
 
 const AGENT_SELECT_COLUMNS: &str = "id, name, state, provider, display_order, attention_state, task_id, active_session_id, last_snippet, last_input_required_at, updated_at";
 const MANAGED_SESSION_SELECT_COLUMNS: &str = "id, provider, status, launch_command, launch_args_json, cwd, pid, agent_id, task_id, last_heartbeat_at, started_at, ended_at, needs_input, input_reason, last_activity_at, transport, attach_count, failure_reason, metadata_json, created_at, updated_at";
-const SESSION_ALERT_SELECT_COLUMNS: &str = "id, session_id, agent_id, severity, reason, message, requires_ack, acknowledged_at, snoozed_until, escalated_at, escalation_count, resolved_at, created_at, updated_at";
+const SESSION_ALERT_SELECT_COLUMNS: &str = "id, session_id, agent_id, severity, reason, message, message_enriched, message_enrichment_status, message_enriched_at, message_enrichment_error, requires_ack, acknowledged_at, snoozed_until, escalated_at, escalation_count, resolved_at, created_at, updated_at";
+const RUNTIME_ISSUE_SELECT_COLUMNS: &str = "kind, source, raw_message, enriched_message, enrichment_status, enrichment_error, first_seen_at, last_seen_at, seen_count, dismissed_until, resolved_at";
+
+#[derive(Debug, Clone, Default)]
+pub struct AlertEnrichmentInput {
+    pub message_enriched: Option<String>,
+    pub message_enrichment_status: Option<String>,
+    pub message_enrichment_error: Option<String>,
+}
 
 impl Db {
     async fn refresh_agent_attention_state_with_conn(
@@ -347,6 +355,7 @@ impl Db {
         status: &str,
         failure_reason: Option<&str>,
     ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE managed_sessions SET status = ?, failure_reason = ?, started_at = CASE WHEN ? = 'active' AND started_at IS NULL THEN CURRENT_TIMESTAMP ELSE started_at END, ended_at = CASE WHEN ? IN ('ended', 'failed') THEN CURRENT_TIMESTAMP ELSE ended_at END, attach_count = CASE WHEN ? IN ('ended', 'failed') THEN 0 ELSE attach_count END, last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
@@ -356,12 +365,36 @@ impl Db {
         .bind(status)
         .bind(status)
         .bind(session_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        if matches!(status, "ended" | "failed") {
+            sqlx::query(
+                "UPDATE agents
+                 SET active_session_id = (
+                     SELECT ms.id
+                     FROM managed_sessions ms
+                     WHERE ms.agent_id = agents.id
+                       AND ms.id <> ?
+                       AND ms.status IN ('waking', 'active', 'stalled', 'needs_input')
+                     ORDER BY COALESCE(ms.last_activity_at, ms.last_heartbeat_at, ms.updated_at) DESC, ms.id DESC
+                     LIMIT 1
+                 ),
+                 updated_at = CURRENT_TIMESTAMP
+                 WHERE active_session_id = ?",
+            )
+            .bind(session_id)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn end_session_if_open(&self, session_id: i64, reason: Option<&str>) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE managed_sessions
              SET status = 'ended',
@@ -377,17 +410,33 @@ impl Db {
         )
         .bind(reason)
         .bind(session_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() > 0 {
-            sqlx::query("UPDATE agents SET active_session_id = NULL WHERE active_session_id = ?")
+            sqlx::query(
+                "UPDATE agents
+                 SET active_session_id = (
+                     SELECT ms.id
+                     FROM managed_sessions ms
+                     WHERE ms.agent_id = agents.id
+                       AND ms.id <> ?
+                       AND ms.status IN ('waking', 'active', 'stalled', 'needs_input')
+                     ORDER BY COALESCE(ms.last_activity_at, ms.last_heartbeat_at, ms.updated_at) DESC, ms.id DESC
+                     LIMIT 1
+                 ),
+                 updated_at = CURRENT_TIMESTAMP
+                 WHERE active_session_id = ?",
+            )
                 .bind(session_id)
-                .execute(&self.pool)
+                .bind(session_id)
+                .execute(&mut *tx)
                 .await?;
+            tx.commit().await?;
             return Ok(true);
         }
 
+        tx.commit().await?;
         Ok(false)
     }
 
@@ -599,33 +648,68 @@ impl Db {
     }
 
     pub async fn end_session(&self, session_id: i64, reason: Option<&str>) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE managed_sessions SET status = 'ended', failure_reason = ?, ended_at = CURRENT_TIMESTAMP, needs_input = 0, input_reason = NULL, attach_count = 0, last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(reason)
         .bind(session_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE agents SET active_session_id = NULL WHERE active_session_id = ?")
+        sqlx::query(
+            "UPDATE agents
+             SET active_session_id = (
+                 SELECT ms.id
+                 FROM managed_sessions ms
+                 WHERE ms.agent_id = agents.id
+                   AND ms.id <> ?
+                   AND ms.status IN ('waking', 'active', 'stalled', 'needs_input')
+                 ORDER BY COALESCE(ms.last_activity_at, ms.last_heartbeat_at, ms.updated_at) DESC, ms.id DESC
+                 LIMIT 1
+             ),
+             updated_at = CURRENT_TIMESTAMP
+             WHERE active_session_id = ?",
+        )
             .bind(session_id)
-            .execute(&self.pool)
+            .bind(session_id)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn delete_managed_session(&self, session_id: i64) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE agents SET active_session_id = NULL WHERE active_session_id = ?")
+        let exists = sqlx::query_scalar::<_, i64>("SELECT id FROM managed_sessions WHERE id = ?")
             .bind(session_id)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
-        let result = sqlx::query("DELETE FROM managed_sessions WHERE id = ?")
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await?;
-        if result.rows_affected() == 0 {
+        if exists.is_none() {
             return Err(anyhow!("session not found"));
         }
+
+        sqlx::query(
+            "UPDATE agents
+             SET active_session_id = (
+                 SELECT ms.id
+                 FROM managed_sessions ms
+                 WHERE ms.agent_id = agents.id
+                   AND ms.id <> ?
+                   AND ms.status IN ('waking', 'active', 'stalled', 'needs_input')
+                 ORDER BY COALESCE(ms.last_activity_at, ms.last_heartbeat_at, ms.updated_at) DESC, ms.id DESC
+                 LIMIT 1
+             ),
+             updated_at = CURRENT_TIMESTAMP
+             WHERE active_session_id = ?",
+        )
+            .bind(session_id)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM managed_sessions WHERE id = ?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -703,6 +787,28 @@ impl Db {
         message: &str,
         requires_ack: bool,
     ) -> Result<SessionAlert> {
+        self.create_session_alert_with_enrichment(
+            session_id,
+            agent_id,
+            severity,
+            reason,
+            message,
+            requires_ack,
+            AlertEnrichmentInput::default(),
+        )
+        .await
+    }
+
+    pub async fn create_session_alert_with_enrichment(
+        &self,
+        session_id: i64,
+        agent_id: Option<i64>,
+        severity: &str,
+        reason: &str,
+        message: &str,
+        requires_ack: bool,
+        enrichment: AlertEnrichmentInput,
+    ) -> Result<SessionAlert> {
         let mut conn = self.pool.acquire().await?;
         let linked_agent_id = match agent_id {
             Some(id) => Some(id),
@@ -730,12 +836,33 @@ impl Db {
         .fetch_optional(&mut *conn)
         .await?;
 
+        let enrichment_status = enrichment
+            .message_enrichment_status
+            .unwrap_or_else(|| "pending".to_string());
+        let enrichment_output = enrichment.message_enriched.and_then(|value| {
+            if value.trim().is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        });
+        let enrichment_error = enrichment.message_enrichment_error;
+        let enriched_at = if enrichment_output.is_some() {
+            Some("CURRENT_TIMESTAMP")
+        } else {
+            None
+        };
+
         let alert = if let Some(alert_id) = existing_alert_id {
             sqlx::query(
                 "UPDATE session_alerts
                  SET severity = ?,
                      requires_ack = ?,
                      agent_id = COALESCE(agent_id, ?),
+                     message_enriched = ?,
+                     message_enrichment_status = ?,
+                     message_enrichment_error = ?,
+                     message_enriched_at = CASE WHEN ? IS NOT NULL THEN CURRENT_TIMESTAMP ELSE NULL END,
                      snoozed_until = NULL,
                      updated_at = CURRENT_TIMESTAMP
                  WHERE id = ?",
@@ -743,6 +870,10 @@ impl Db {
             .bind(severity)
             .bind(requires_ack)
             .bind(linked_agent_id)
+            .bind(enrichment_output.as_deref())
+            .bind(&enrichment_status)
+            .bind(enrichment_error.as_deref())
+            .bind(enriched_at)
             .bind(alert_id)
             .execute(&mut *conn)
             .await?;
@@ -756,13 +887,28 @@ impl Db {
             .await?
         } else {
             sqlx::query(
-                "INSERT INTO session_alerts (session_id, agent_id, severity, reason, message, requires_ack) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO session_alerts (
+                    session_id,
+                    agent_id,
+                    severity,
+                    reason,
+                    message,
+                    message_enriched,
+                    message_enrichment_status,
+                    message_enrichment_error,
+                    message_enriched_at,
+                    requires_ack
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NOT NULL THEN CURRENT_TIMESTAMP ELSE NULL END, ?)",
             )
             .bind(session_id)
             .bind(linked_agent_id)
             .bind(severity)
             .bind(reason)
             .bind(message)
+            .bind(enrichment_output.as_deref())
+            .bind(&enrichment_status)
+            .bind(enrichment_error.as_deref())
+            .bind(enriched_at)
             .bind(requires_ack)
             .execute(&mut *conn)
             .await?;
@@ -792,6 +938,8 @@ impl Db {
                 "severity": alert.severity,
                 "reason": alert.reason,
                 "message": alert.message,
+                "messageEnriched": alert.message_enriched,
+                "messageEnrichmentStatus": alert.message_enrichment_status,
                 "requiresAck": alert.requires_ack
             })
             .to_string(),
@@ -811,6 +959,32 @@ impl Db {
         .fetch_one(&self.pool)
         .await?;
         Ok(alert)
+    }
+
+    pub async fn update_session_alert_enrichment(
+        &self,
+        alert_id: i64,
+        message_enriched: Option<&str>,
+        message_enrichment_status: &str,
+        message_enrichment_error: Option<&str>,
+    ) -> Result<SessionAlert> {
+        sqlx::query(
+            "UPDATE session_alerts
+             SET message_enriched = ?,
+                 message_enrichment_status = ?,
+                 message_enrichment_error = ?,
+                 message_enriched_at = CASE WHEN ? IS NOT NULL THEN CURRENT_TIMESTAMP ELSE NULL END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(message_enriched)
+        .bind(message_enrichment_status)
+        .bind(message_enrichment_error)
+        .bind(message_enriched)
+        .bind(alert_id)
+        .execute(&self.pool)
+        .await?;
+        self.get_session_alert(alert_id).await
     }
 
     pub async fn acknowledge_session_alert(&self, alert_id: i64) -> Result<SessionAlert> {
@@ -1008,6 +1182,111 @@ impl Db {
             }
         };
         Ok(alerts)
+    }
+
+    pub async fn get_runtime_issue(&self, kind: &str) -> Result<RuntimeIssue> {
+        let issue = sqlx::query_as::<_, RuntimeIssue>(&format!(
+            "SELECT {} FROM runtime_issues WHERE kind = ?",
+            RUNTIME_ISSUE_SELECT_COLUMNS
+        ))
+        .bind(kind)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(issue)
+    }
+
+    pub async fn report_runtime_issue(
+        &self,
+        kind: &str,
+        source: &str,
+        raw_message: &str,
+        enriched_message: Option<&str>,
+        enrichment_status: &str,
+        enrichment_error: Option<&str>,
+    ) -> Result<RuntimeIssue> {
+        sqlx::query(
+            "INSERT INTO runtime_issues (
+                kind,
+                source,
+                raw_message,
+                enriched_message,
+                enrichment_status,
+                enrichment_error,
+                first_seen_at,
+                last_seen_at,
+                seen_count,
+                dismissed_until,
+                resolved_at
+            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1, NULL, NULL)
+            ON CONFLICT(kind) DO UPDATE SET
+                source = excluded.source,
+                raw_message = excluded.raw_message,
+                enriched_message = excluded.enriched_message,
+                enrichment_status = excluded.enrichment_status,
+                enrichment_error = excluded.enrichment_error,
+                last_seen_at = CURRENT_TIMESTAMP,
+                seen_count = runtime_issues.seen_count + 1,
+                resolved_at = NULL",
+        )
+        .bind(kind)
+        .bind(source)
+        .bind(raw_message)
+        .bind(enriched_message)
+        .bind(enrichment_status)
+        .bind(enrichment_error)
+        .execute(&self.pool)
+        .await?;
+        self.get_runtime_issue(kind).await
+    }
+
+    pub async fn list_visible_runtime_issues(
+        &self,
+        limit: Option<i64>,
+    ) -> Result<Vec<RuntimeIssue>> {
+        let max = limit.unwrap_or(100);
+        let rows = sqlx::query_as::<_, RuntimeIssue>(&format!(
+            "SELECT {} FROM runtime_issues
+             WHERE resolved_at IS NULL
+               AND (dismissed_until IS NULL OR dismissed_until <= CURRENT_TIMESTAMP)
+             ORDER BY last_seen_at DESC
+             LIMIT ?",
+            RUNTIME_ISSUE_SELECT_COLUMNS
+        ))
+        .bind(max)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn dismiss_runtime_issue(
+        &self,
+        kind: &str,
+        duration_ms: i64,
+    ) -> Result<RuntimeIssue> {
+        let seconds = (duration_ms.max(0) + 999) / 1000;
+        sqlx::query(
+            "UPDATE runtime_issues
+             SET dismissed_until = datetime(CURRENT_TIMESTAMP, '+' || ? || ' seconds')
+             WHERE kind = ?",
+        )
+        .bind(seconds)
+        .bind(kind)
+        .execute(&self.pool)
+        .await?;
+        self.get_runtime_issue(kind).await
+    }
+
+    pub async fn clear_runtime_issue(&self, kind: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE runtime_issues
+             SET resolved_at = CURRENT_TIMESTAMP,
+                 dismissed_until = NULL
+             WHERE kind = ?",
+        )
+        .bind(kind)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn upsert_linear_issue(

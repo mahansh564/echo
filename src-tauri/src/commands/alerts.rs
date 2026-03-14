@@ -1,9 +1,13 @@
 use crate::commands::emit_agent_updated;
+use crate::config::EchoConfig;
 use crate::db::models::SessionAlert;
 use crate::db::Db;
+use crate::issue_enrichment::enrich_issue_message;
 use crate::telemetry::Telemetry;
 use serde::Serialize;
 use tauri::Emitter;
+
+const ALERT_ENRICH_BACKFILL_BUDGET: usize = 3;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,16 +69,62 @@ pub async fn escalate_session_alert(db: &Db, alert_id: i64) -> anyhow::Result<Se
     db.escalate_session_alert(alert_id).await
 }
 
+async fn backfill_unresolved_alert_enrichment(
+    db: &Db,
+    model_endpoint: &str,
+    alerts: &[SessionAlert],
+) -> anyhow::Result<bool> {
+    let mut attempted = false;
+    for alert in alerts
+        .iter()
+        .filter(|entry| {
+            entry.message_enriched.is_none()
+                && matches!(
+                    entry.message_enrichment_status.as_str(),
+                    "pending" | "failed" | ""
+                )
+        })
+        .take(ALERT_ENRICH_BACKFILL_BUDGET)
+    {
+        attempted = true;
+        let enrichment = enrich_issue_message(model_endpoint, &alert.message).await;
+        db.update_session_alert_enrichment(
+            alert.id,
+            enrichment.cleaned.as_deref(),
+            &enrichment.status,
+            enrichment.error.as_deref(),
+        )
+        .await?;
+    }
+
+    Ok(attempted)
+}
+
 #[tauri::command]
 pub async fn list_session_alerts_cmd(
     db: tauri::State<'_, Db>,
+    config: tauri::State<'_, EchoConfig>,
     agent_id: Option<i64>,
     unresolved_only: Option<bool>,
     limit: Option<i64>,
 ) -> Result<Vec<SessionAlert>, String> {
-    list_session_alerts(&db, agent_id, unresolved_only, limit)
+    let unresolved = unresolved_only.unwrap_or(true);
+    let mut alerts = list_session_alerts(&db, agent_id, Some(unresolved), limit)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    if unresolved {
+        let attempted = backfill_unresolved_alert_enrichment(&db, &config.model_endpoint, &alerts)
+            .await
+            .map_err(|e| e.to_string())?;
+        if attempted {
+            alerts = list_session_alerts(&db, agent_id, Some(unresolved), limit)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(alerts)
 }
 
 #[tauri::command]

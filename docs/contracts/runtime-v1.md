@@ -118,6 +118,7 @@ Required events and payloads:
   "last_activity_at": "2026-03-04T19:22:00Z"
 }
 ```
+`active_session_id` is the agent's preferred/current open session pointer, not necessarily the session that emitted the latest runtime event.
 
 ### `agent_attention_updated`
 ```json

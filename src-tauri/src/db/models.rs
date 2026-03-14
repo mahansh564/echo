@@ -72,6 +72,10 @@ pub struct SessionAlert {
     pub severity: String,
     pub reason: String,
     pub message: String,
+    pub message_enriched: Option<String>,
+    pub message_enrichment_status: String,
+    pub message_enriched_at: Option<String>,
+    pub message_enrichment_error: Option<String>,
     pub requires_ack: bool,
     pub acknowledged_at: Option<String>,
     pub snoozed_until: Option<String>,
@@ -80,6 +84,22 @@ pub struct SessionAlert {
     pub resolved_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeIssue {
+    pub kind: String,
+    pub source: String,
+    pub raw_message: String,
+    pub enriched_message: Option<String>,
+    pub enrichment_status: String,
+    pub enrichment_error: Option<String>,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub seen_count: i64,
+    pub dismissed_until: Option<String>,
+    pub resolved_at: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

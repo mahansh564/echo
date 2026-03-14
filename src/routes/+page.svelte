@@ -132,15 +132,31 @@
 
   type RuntimeIssueSeverity = "warning" | "critical";
 
+  type RuntimeIssueSource = "voice" | "terminal" | "session_alert" | "system";
+
+  type RuntimeIssueRecord = {
+    kind: RuntimeIssueKind;
+    source: RuntimeIssueSource;
+    rawMessage: string;
+    enrichedMessage?: string | null;
+    enrichmentStatus: "pending" | "success" | "failed" | string;
+    enrichmentError?: string | null;
+    firstSeenAt: string;
+    lastSeenAt: string;
+    seenCount: number;
+    dismissedUntil?: string | null;
+    resolvedAt?: string | null;
+  };
+
   type RuntimeIssue = {
     kind: RuntimeIssueKind;
     severity: RuntimeIssueSeverity;
     title: string;
     guidance: string;
     message: string;
-    source: "voice" | "terminal" | "session_alert" | "system";
-    firstSeenAt: number;
-    lastSeenAt: number;
+    source: RuntimeIssueSource;
+    firstSeenAt: string;
+    lastSeenAt: string;
     count: number;
   };
 
@@ -151,6 +167,10 @@
     severity: string;
     reason: string;
     message: string;
+    messageEnriched?: string | null;
+    messageEnrichmentStatus: "pending" | "success" | "failed" | string;
+    messageEnrichedAt?: string | null;
+    messageEnrichmentError?: string | null;
     requiresAck: boolean;
     acknowledgedAt?: string | null;
     snoozedUntil?: string | null;
@@ -168,8 +188,34 @@
     severity: string;
     reason: string;
     message: string;
+    messageEnriched?: string | null;
+    messageEnrichmentStatus: "pending" | "success" | "failed" | string;
+    messageEnrichedAt?: string | null;
     requiresAck: boolean;
     createdAt: string;
+  };
+
+  type SessionAlertResolvedEvent = {
+    alertId: number;
+    sessionId: number;
+    agentId?: number | null;
+    resolvedAt?: string | null;
+  };
+
+  type SessionAlertSnoozedEvent = {
+    alertId: number;
+    sessionId: number;
+    agentId?: number | null;
+    snoozedUntil?: string | null;
+  };
+
+  type SessionAlertEscalatedEvent = {
+    alertId: number;
+    sessionId: number;
+    agentId?: number | null;
+    severity: string;
+    escalatedAt?: string | null;
+    escalationCount?: number;
   };
 
   type AlertToast = {
@@ -262,7 +308,7 @@
   let unresolvedAlertsLoading = $state<boolean>(false);
   let alertActionBusyId = $state<number | null>(null);
   let alertToasts = $state<AlertToast[]>([]);
-  let runtimeIssues = $state<RuntimeIssue[]>([]);
+  let runtimeIssueRecords = $state<RuntimeIssueRecord[]>([]);
 
   let terminalWidget: Terminal | null = null;
   let fitAddon: FitAddon | null = null;
@@ -295,7 +341,6 @@
   const LISTENER_RECONNECT_MAX_MS = 15000;
   const ALERT_TOAST_MAX = 4;
   const ALERT_TOAST_TTL_MS = 8000;
-  const RUNTIME_ISSUE_MAX = 6;
   const UI_SNIPPET_MAX_CHARS = 180;
   const UI_RUNTIME_ISSUE_MAX_CHARS = 240;
   const UI_VOICE_LINE_MAX_CHARS = 220;
@@ -379,13 +424,45 @@
     sessions.filter((session) => isActiveSessionStatus(session.status))
   );
 
-  const activeRuntimeIssues = $derived(
-    [...runtimeIssues].sort((left, right) => {
-      if (left.severity !== right.severity) {
-        return left.severity === "critical" ? -1 : 1;
-      }
-      return right.lastSeenAt - left.lastSeenAt;
+  const openAgentSessions = $derived.by(() =>
+    [...activeSessions].sort((left, right) => {
+      const leftAt = left.lastActivityAt ?? left.updatedAt;
+      const rightAt = right.lastActivityAt ?? right.updatedAt;
+      return new Date(rightAt).getTime() - new Date(leftAt).getTime();
     })
+  );
+
+  const visibleInputRequests = $derived(
+    unresolvedAlerts.filter((alert) => !alert.acknowledgedAt)
+  );
+
+  const activeRuntimeIssues = $derived.by(() =>
+    runtimeIssueRecords
+      .map((issue): RuntimeIssue => {
+        const meta = RUNTIME_ISSUE_META[issue.kind];
+        return {
+          kind: issue.kind,
+          severity: meta.severity,
+          title: meta.title,
+          guidance: meta.guidance,
+          message: sanitizeDisplayText(
+            issue.enrichedMessage ?? issue.rawMessage,
+            UI_RUNTIME_ISSUE_MAX_CHARS
+          ),
+          source: issue.source,
+          firstSeenAt: issue.firstSeenAt,
+          lastSeenAt: issue.lastSeenAt,
+          count: issue.seenCount
+        };
+      })
+      .sort((left, right) => {
+        if (left.severity !== right.severity) {
+          return left.severity === "critical" ? -1 : 1;
+        }
+        return (
+          new Date(right.lastSeenAt).getTime() - new Date(left.lastSeenAt).getTime()
+        );
+      })
   );
 
   const toTitleCase = (value: string) =>
@@ -449,6 +526,11 @@
     return cleaned || null;
   };
 
+  const displayAlertMessage = (alert: {
+    message: string;
+    messageEnriched?: string | null;
+  }) => sanitizeDisplayText(alert.messageEnriched ?? alert.message, UI_SNIPPET_MAX_CHARS);
+
   const summarizeVoiceIntent = (event: VoiceIntentEvent) => {
     const agentIndex = event.payload?.agent_index;
     const agentHint = event.payload?.agent_name_hint;
@@ -507,54 +589,46 @@
     return null;
   };
 
-  function clearRuntimeIssue(kind: RuntimeIssueKind) {
-    runtimeIssues = runtimeIssues.filter((issue) => issue.kind !== kind);
+  async function clearRuntimeIssue(kind: RuntimeIssueKind) {
+    try {
+      await invoke("clear_runtime_issue_cmd", { kind });
+      runtimeIssueRecords = runtimeIssueRecords.filter((issue) => issue.kind !== kind);
+    } catch (error) {
+      console.error("Failed to clear runtime issue", error);
+    }
   }
 
-  function dismissRuntimeIssue(kind: RuntimeIssueKind) {
-    clearRuntimeIssue(kind);
+  async function dismissRuntimeIssue(kind: RuntimeIssueKind) {
+    try {
+      await invoke("dismiss_runtime_issue_cmd", { kind });
+      runtimeIssueRecords = runtimeIssueRecords.filter((issue) => issue.kind !== kind);
+    } catch (error) {
+      console.error("Failed to dismiss runtime issue", error);
+    }
   }
 
-  function reportRuntimeIssue(input: {
+  async function reportRuntimeIssue(input: {
     error: unknown;
-    source: RuntimeIssue["source"];
+    source: RuntimeIssueSource;
     forcedKind?: RuntimeIssueKind;
   }) {
     const message = normalizeErrorMessage(input.error).trim();
     if (!message) return;
     const kind = classifyRuntimeIssue(message, input.forcedKind);
     if (!kind) return;
-
-    const meta = RUNTIME_ISSUE_META[kind];
-    const now = Date.now();
-    const existing = runtimeIssues.find((issue) => issue.kind === kind);
-    if (existing) {
-      runtimeIssues = runtimeIssues.map((issue) =>
-        issue.kind === kind
-          ? {
-              ...issue,
-              message,
-              source: input.source,
-              lastSeenAt: now,
-              count: issue.count + 1
-            }
-          : issue
-      );
-      return;
+    try {
+      const updated = (await invoke("report_runtime_issue_cmd", {
+        kind,
+        source: input.source,
+        message
+      })) as RuntimeIssueRecord;
+      runtimeIssueRecords = [
+        updated,
+        ...runtimeIssueRecords.filter((issue) => issue.kind !== updated.kind)
+      ].slice(0, 200);
+    } catch (error) {
+      console.error("Failed to report runtime issue", error);
     }
-
-    const next: RuntimeIssue = {
-      kind,
-      severity: meta.severity,
-      title: meta.title,
-      guidance: meta.guidance,
-      message,
-      source: input.source,
-      firstSeenAt: now,
-      lastSeenAt: now,
-      count: 1
-    };
-    runtimeIssues = [next, ...runtimeIssues].slice(0, RUNTIME_ISSUE_MAX);
   }
 
   function restoreTerminalViewportState() {
@@ -639,14 +713,16 @@
       loading = true;
     }
     try {
-      const [agentRowsResponse, sessionsResponse, alertsResponse] = await Promise.all([
+      const [agentRowsResponse, sessionsResponse, alertsResponse, runtimeIssuesResponse] =
+        await Promise.all([
         invoke("list_agent_rows_cmd", { limit: 200 }),
         invoke("list_managed_sessions_cmd", { status: null, limit: 200 }),
         invoke("list_session_alerts_cmd", {
           agentId: null,
           unresolvedOnly: true,
           limit: 200
-        })
+        }),
+        invoke("list_runtime_issues_cmd", { limit: 200 })
       ]);
 
       const mappedAgents = (agentRowsResponse as AgentRowPayload[]).map((row) => ({
@@ -672,8 +748,10 @@
       sessions = sessionsResponse as SessionRuntime[];
       unresolvedAlerts = (alertsResponse as SessionAlert[]).map((alert) => ({
         ...alert,
-        message: sanitizeDisplayText(alert.message, UI_SNIPPET_MAX_CHARS)
+        message: sanitizeDisplayText(alert.message, UI_SNIPPET_MAX_CHARS),
+        messageEnriched: sanitizeOptionalText(alert.messageEnriched ?? null, UI_SNIPPET_MAX_CHARS)
       }));
+      runtimeIssueRecords = runtimeIssuesResponse as RuntimeIssueRecord[];
 
       if (agents.length > 0 && !agents.some((agent) => agent.id === selectedAgentId)) {
         selectedAgentId = agents[0].id;
@@ -708,7 +786,7 @@
     } catch (error) {
       console.error("Failed to load data", error);
       unresolvedAlerts = [];
-      reportRuntimeIssue({ error, source: "system" });
+      await reportRuntimeIssue({ error, source: "system" });
     } finally {
       if (!background) {
         loading = false;
@@ -736,11 +814,11 @@
           provider
         }
       });
-      clearRuntimeIssue("adapter_down");
+      await clearRuntimeIssue("adapter_down");
       await loadData();
     } catch (error) {
       console.error("Failed to start managed session", error);
-      reportRuntimeIssue({
+      await reportRuntimeIssue({
         error,
         source: "terminal",
         forcedKind: "adapter_down"
@@ -750,6 +828,9 @@
 
   const lookupAgentName = (agentId?: number | null) =>
     agents.find((agent) => agent.id === agentId)?.name ?? "Unassigned";
+
+  const lookupAgentTaskTitle = (agentId?: number | null) =>
+    agents.find((agent) => agent.id === agentId)?.taskTitle ?? "Unassigned";
 
   const filterIncludes = (value: string, query: string) => value.toLowerCase().includes(query);
 
@@ -796,7 +877,8 @@
       .filter((alert) => {
         if (!query) return true;
         const agentName = lookupAgentName(alert.agentId);
-        const haystack = `${agentName} ${alert.reason} ${alert.message} ${alert.sessionId}`.toLowerCase();
+        const displayMessage = displayAlertMessage(alert);
+        const haystack = `${agentName} ${alert.reason} ${displayMessage} ${alert.sessionId}`.toLowerCase();
         return haystack.includes(query);
       })
       .slice(0, 20)
@@ -804,7 +886,7 @@
         id: `alert-${alert.id}`,
         kind: "alert" as const,
         label: `${lookupAgentName(alert.agentId)} · ${toTitleCase(alert.reason)}`,
-        meta: `Session #${alert.sessionId} · ${alert.message}`,
+        meta: `Session #${alert.sessionId} · ${displayAlertMessage(alert)}`,
         alert
       }));
 
@@ -828,7 +910,8 @@
       })) as SessionAlert[];
       unresolvedAlerts = alerts.map((alert) => ({
         ...alert,
-        message: sanitizeDisplayText(alert.message, UI_SNIPPET_MAX_CHARS)
+        message: sanitizeDisplayText(alert.message, UI_SNIPPET_MAX_CHARS),
+        messageEnriched: sanitizeOptionalText(alert.messageEnriched ?? null, UI_SNIPPET_MAX_CHARS)
       }));
     } catch (error) {
       console.error("Failed to load unresolved alerts", error);
@@ -855,6 +938,10 @@
       severity: payload.severity,
       reason: payload.reason,
       message: sanitizeDisplayText(payload.message, UI_SNIPPET_MAX_CHARS),
+      messageEnriched: sanitizeOptionalText(payload.messageEnriched ?? null, UI_SNIPPET_MAX_CHARS),
+      messageEnrichmentStatus: payload.messageEnrichmentStatus ?? "pending",
+      messageEnrichedAt: payload.messageEnrichedAt ?? null,
+      messageEnrichmentError: null,
       requiresAck: payload.requiresAck,
       acknowledgedAt: null,
       snoozedUntil: null,
@@ -870,8 +957,39 @@
     ].slice(0, 200);
   }
 
+  function removeUnresolvedAlertById(alertId: number) {
+    for (const toast of alertToasts) {
+      if (toast.alertId === alertId) {
+        dismissAlertToast(toast.id);
+      }
+    }
+    unresolvedAlerts = unresolvedAlerts.filter((entry) => entry.id !== alertId);
+  }
+
+  function applyEscalatedAlert(payload: SessionAlertEscalatedEvent) {
+    let found = false;
+    unresolvedAlerts = unresolvedAlerts.map((entry) => {
+      if (entry.id !== payload.alertId) return entry;
+      found = true;
+      return {
+        ...entry,
+        severity: payload.severity,
+        escalatedAt: payload.escalatedAt ?? entry.escalatedAt,
+        escalationCount: payload.escalationCount ?? entry.escalationCount ?? 0,
+        snoozedUntil: null
+      };
+    });
+    if (!found) {
+      void loadUnresolvedAlerts();
+    }
+  }
+
   function enqueueAlertToast(payload: SessionAlertCreatedEvent) {
     const toastId = `${payload.alertId}-${Date.now()}`;
+    const displayMessage = sanitizeDisplayText(
+      payload.messageEnriched ?? payload.message,
+      UI_SNIPPET_MAX_CHARS
+    );
     const toast: AlertToast = {
       id: toastId,
       alertId: payload.alertId,
@@ -879,7 +997,7 @@
       agentId: payload.agentId ?? null,
       severity: payload.severity,
       reason: payload.reason,
-      message: sanitizeDisplayText(payload.message, UI_SNIPPET_MAX_CHARS)
+      message: displayMessage
     };
 
     const nextToasts = [toast, ...alertToasts];
@@ -930,6 +1048,12 @@
     switch (commandId) {
       case "show-unresolved-inputs":
         await loadUnresolvedAlerts();
+        paletteQuery = "";
+        await tick();
+        paletteSelectedIndex = Math.max(
+          0,
+          paletteEntries.findIndex((entry) => entry.kind === "alert")
+        );
         break;
       case "voice-query-input-needed":
         closeCommandPalette();
@@ -1270,10 +1394,10 @@
 
     try {
       await invoke("process_voice_text_cmd", { text: transcript });
-      clearRuntimeIssue("model_down");
+      await clearRuntimeIssue("model_down");
     } catch (error) {
       console.error("Failed to process voice text", error);
-      reportRuntimeIssue({ error, source: "voice" });
+      await reportRuntimeIssue({ error, source: "voice" });
     }
   }
 
@@ -1289,11 +1413,11 @@
     pushToTalkBusy = true;
     try {
       await invoke("push_to_talk_cmd");
-      clearRuntimeIssue("mic_unavailable");
-      clearRuntimeIssue("model_down");
+      await clearRuntimeIssue("mic_unavailable");
+      await clearRuntimeIssue("model_down");
     } catch (error) {
       console.error("Failed to run push-to-talk command", error);
-      reportRuntimeIssue({ error, source: "voice" });
+      await reportRuntimeIssue({ error, source: "voice" });
     } finally {
       pushToTalkBusy = false;
       invoke("voice_status_cmd")
@@ -1307,7 +1431,7 @@
         })
         .catch((error) => {
           console.error("Failed to refresh voice status", error);
-          reportRuntimeIssue({ error, source: "voice" });
+          void reportRuntimeIssue({ error, source: "voice" });
         });
     }
   }
@@ -1401,10 +1525,18 @@
         }),
         listen("agent_runtime_updated", (event) => {
           const payload = event.payload as AgentRuntimeUpdatedEvent;
+          const selectedSession = selectedSessionId
+            ? sessions.find((session) => session.id === selectedSessionId)
+            : undefined;
+          const selectedSessionIsActiveForAgent =
+            !!selectedSession &&
+            selectedSession.agentId === payload.agentId &&
+            isActiveSessionStatus(selectedSession.status);
           if (
             payload.activeSessionId &&
             selectedAgentId === payload.agentId &&
-            selectedSessionId !== payload.activeSessionId
+            selectedSessionId !== payload.activeSessionId &&
+            !selectedSessionIsActiveForAgent
           ) {
             void setSelectedSession(payload.activeSessionId, { reset: false });
           }
@@ -1414,7 +1546,25 @@
           const payload = event.payload as SessionAlertCreatedEvent;
           upsertUnresolvedAlertFromEvent(payload);
           enqueueAlertToast(payload);
-          reportRuntimeIssue({ error: payload.message, source: "session_alert" });
+          void reportRuntimeIssue({
+            error: payload.messageEnriched ?? payload.message,
+            source: "session_alert"
+          });
+        }),
+        listen("session_alert_resolved", (event) => {
+          const payload = event.payload as SessionAlertResolvedEvent;
+          removeUnresolvedAlertById(payload.alertId);
+          void loadData({ background: true });
+        }),
+        listen("session_alert_snoozed", (event) => {
+          const payload = event.payload as SessionAlertSnoozedEvent;
+          removeUnresolvedAlertById(payload.alertId);
+          void loadData({ background: true });
+        }),
+        listen("session_alert_escalated", (event) => {
+          const payload = event.payload as SessionAlertEscalatedEvent;
+          applyEscalatedAlert(payload);
+          void loadData({ background: true });
         }),
         listen("managed_session_prompt_required", async (event) => {
           const payload = event.payload as ManagedSessionPromptRequiredEvent;
@@ -1463,7 +1613,7 @@
             `error: ${payload.message}`,
             UI_VOICE_LINE_MAX_CHARS
           );
-          reportRuntimeIssue({ error: payload.message, source: "voice" });
+          void reportRuntimeIssue({ error: payload.message, source: "voice" });
         }),
         listen("voice_status_reply", (event) => {
           const payload = event.payload as VoiceStatusReplyEvent;
@@ -1474,7 +1624,7 @@
       return true;
     } catch (error) {
       console.error("Failed to register UI listeners", error);
-      reportRuntimeIssue({ error, source: "system" });
+      await reportRuntimeIssue({ error, source: "system" });
       clearUiListeners();
       return false;
     }
@@ -1537,7 +1687,7 @@
       })
       .catch((error) => {
         console.error("Failed to get voice status", error);
-        reportRuntimeIssue({ error, source: "voice" });
+        void reportRuntimeIssue({ error, source: "voice" });
       });
 
     const interval = setInterval(() => {
@@ -1636,11 +1786,13 @@
               <p>{issue.message}</p>
               <p>{issue.guidance}</p>
               <span>
-                Source: {issue.source} · Seen {formatRelativeTime(new Date(issue.lastSeenAt).toISOString())} ·
+                Source: {issue.source} · Seen {formatRelativeTime(issue.lastSeenAt)} ·
                 Count {issue.count}
               </span>
             </div>
-            <button class="ghost compact" onclick={() => dismissRuntimeIssue(issue.kind)}>Dismiss</button>
+            <button class="ghost compact" onclick={() => void dismissRuntimeIssue(issue.kind)}
+              >Dismiss</button
+            >
           </article>
         {/each}
       </div>
@@ -1721,72 +1873,76 @@
     </section>
 
     <aside class="activity-pane">
-      <header class="pane-header">
-        <h2>Current agent</h2>
-        <div class="pane-header-actions">
-          <span>{unresolvedAlerts.length} alerts</span>
+      <section class="activity-split-panel" aria-label="Open sessions">
+        <header class="split-panel-header">
+          <h3>Open sessions</h3>
+          <span>{openAgentSessions.length}</span>
+        </header>
+        <div class="split-panel-scroll">
+          {#if openAgentSessions.length === 0}
+            <p class="empty-state">No open sessions.</p>
+          {:else}
+            {#each openAgentSessions as session (session.id)}
+              <article class="open-agent-item">
+                <button
+                  class="open-agent-open"
+                  onclick={() => void focusSession(session.id)}
+                >
+                  <strong>{lookupAgentName(session.agentId)}</strong>
+                  <p>{session.provider} · {toTitleCase(session.status)}</p>
+                  <p>Task: {lookupAgentTaskTitle(session.agentId)}</p>
+                  <p>Session #{session.id}</p>
+                  <p>Last activity: {formatRelativeTime(session.lastActivityAt ?? session.updatedAt)}</p>
+                </button>
+              </article>
+            {/each}
+          {/if}
         </div>
-      </header>
-
-      <section class="current-agent-panel">
-        {#if selectedAgent}
-          <h3>{selectedAgent.name}</h3>
-          <p>{selectedAgent.provider} · {toTitleCase(selectedAgent.attentionState)}</p>
-          <p>Task: {selectedAgent.taskTitle ?? "Unassigned"}</p>
-          <p>
-            Session:
-            {#if selectedSession}
-              #{selectedSession.id} · {toTitleCase(selectedSession.status)}
-            {:else}
-              none
-            {/if}
-          </p>
-          <p>Last activity: {selectedAgent.lastActivityAt ?? selectedAgent.updatedAt}</p>
-        {:else}
-          <p class="empty-state">No focused agent.</p>
-        {/if}
       </section>
 
-      <section class="alerts-summary-panel" aria-label="Unresolved input alerts">
-        <header class="alerts-summary-header">
-          <h3>Input alerts</h3>
-          <span>{unresolvedAlerts.length}</span>
+      <section class="activity-split-panel" aria-label="Input requests">
+        <header class="split-panel-header">
+          <h3>Input requests</h3>
+          <span>{visibleInputRequests.length}</span>
         </header>
-        {#if unresolvedAlertsLoading && unresolvedAlerts.length === 0}
-          <p class="empty-state">Loading unresolved alerts...</p>
-        {:else if unresolvedAlerts.length === 0}
-          <p class="empty-state">No unresolved input alerts.</p>
-        {:else}
-          {@const latestAlert = unresolvedAlerts[0]}
-          <article class={`alert-item severity-${latestAlert.severity.toLowerCase()}`}>
-            <button
-              class="alert-open"
-              onclick={() => {
-                if (latestAlert.agentId) {
-                  focusAgentById(latestAlert.agentId, latestAlert.sessionId);
-                } else {
-                  void focusSession(latestAlert.sessionId);
-                }
-              }}
-            >
-              <strong>{lookupAgentName(latestAlert.agentId)} · {toTitleCase(latestAlert.reason)}</strong>
-              <p>Session #{latestAlert.sessionId} · {toTitleCase(latestAlert.severity)}</p>
-              <p>{latestAlert.message}</p>
-            </button>
-            <div class="alert-item-actions">
-              <button
-                class="ghost compact"
-                onclick={() => void runAlertAction("acknowledge", latestAlert.id)}
-                disabled={alertActionBusyId !== null || !!latestAlert.acknowledgedAt}
-              >
-                {latestAlert.acknowledgedAt ? "Acked" : "Acknowledge"}
-              </button>
-              <button class="ghost compact" onclick={() => void openCommandPalette()}>
-                Open palette
-              </button>
-            </div>
-          </article>
-        {/if}
+        <div class="split-panel-scroll">
+          {#if unresolvedAlertsLoading && visibleInputRequests.length === 0}
+            <p class="empty-state">Loading input requests...</p>
+          {:else if visibleInputRequests.length === 0}
+            <p class="empty-state">No unresolved input requests.</p>
+          {:else}
+            {#each visibleInputRequests as alert (alert.id)}
+              <article class={`alert-item severity-${alert.severity.toLowerCase()}`}>
+                <button
+                  class="alert-open"
+                  onclick={() => {
+                    if (alert.agentId) {
+                      focusAgentById(alert.agentId, alert.sessionId);
+                    } else {
+                      void focusSession(alert.sessionId);
+                    }
+                  }}
+                >
+                  <strong>{lookupAgentName(alert.agentId)} · {toTitleCase(alert.reason)}</strong>
+                  <p>Session #{alert.sessionId} · {toTitleCase(alert.severity)}</p>
+                  <p>{displayAlertMessage(alert)}</p>
+                </button>
+                <div class="alert-item-actions">
+                  <button
+                    class="ghost compact"
+                    onclick={() => void runAlertAction("acknowledge", alert.id)}
+                    disabled={alertActionBusyId !== null || !!alert.acknowledgedAt}
+                  >
+                    {alert.acknowledgedAt ? "Acked" : "Acknowledge"}
+                  </button>
+                  <button class="ghost compact" onclick={() => void openCommandPalette()}>
+                    Open palette
+                  </button>
+                </div>
+              </article>
+            {/each}
+          {/if}
+        </div>
       </section>
     </aside>
   </section>
@@ -2060,6 +2216,8 @@
   }
 
   .activity-pane {
+    display: grid;
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
     gap: 12px;
   }
 
@@ -2070,8 +2228,7 @@
     gap: 8px;
   }
 
-  .pane-header h1,
-  .pane-header h2 {
+  .pane-header h1 {
     margin: 0;
     font-size: 13px;
     letter-spacing: 0.08em;
@@ -2176,48 +2333,85 @@
     gap: 8px;
   }
 
-  .current-agent-panel,
-  .alerts-summary-panel {
+  .activity-split-panel {
     border: 1px solid rgba(118, 138, 162, 0.3);
     border-radius: 6px;
     background: rgba(8, 11, 16, 0.9);
     padding: 10px;
-    display: grid;
-    gap: 6px;
+    min-height: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
   }
 
-  .current-agent-panel h3,
-  .current-agent-panel p {
-    margin: 0;
-  }
-
-  .current-agent-panel h3 {
-    font-size: 13px;
-    color: rgba(229, 236, 245, 0.96);
-  }
-
-  .current-agent-panel p {
-    font-size: 11px;
-    color: rgba(214, 221, 230, 0.78);
-  }
-
-  .alerts-summary-header {
+  .split-panel-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 8px;
   }
 
-  .alerts-summary-header h3 {
+  .split-panel-header h3 {
     margin: 0;
     font-size: 12px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
 
-  .alerts-summary-header span {
+  .split-panel-header span {
     font-size: 11px;
     color: rgba(214, 221, 230, 0.7);
+  }
+
+  .split-panel-scroll {
+    min-height: 0;
+    overflow-y: auto;
+    display: grid;
+    gap: 8px;
+    padding-right: 4px;
+  }
+
+  .open-agent-item {
+    border-radius: 6px;
+    border: 1px solid rgba(118, 138, 162, 0.32);
+    background: rgba(7, 10, 15, 0.9);
+    padding: 8px;
+  }
+
+  .open-agent-open {
+    width: 100%;
+    border: 0;
+    border-radius: 8px;
+    padding: 0;
+    margin: 0;
+    text-align: left;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    transform: none;
+    display: grid;
+    gap: 4px;
+  }
+
+  .open-agent-open:not(:disabled):hover {
+    transform: none;
+  }
+
+  .open-agent-open strong,
+  .open-agent-open p {
+    margin: 0;
+  }
+
+  .open-agent-open strong {
+    font-size: 12px;
+    line-height: 1.3;
+  }
+
+  .open-agent-open p {
+    font-size: 11px;
+    color: rgba(221, 231, 239, 0.77);
+    line-height: 1.35;
   }
 
   .terminal-input-row input,
@@ -2312,6 +2506,7 @@
     border-radius: 8px;
     border: 1px solid rgba(118, 138, 162, 0.42);
     background: rgba(7, 10, 15, 0.98);
+    color: #d6dde6;
     box-shadow: 0 20px 34px rgba(0, 0, 0, 0.5);
     padding: 10px;
   }

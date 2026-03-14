@@ -11,7 +11,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::db::{models::ManagedSession, models::StartSessionRequest, Db};
+use crate::config::EchoConfig;
+use crate::db::{models::ManagedSession, models::StartSessionRequest, AlertEnrichmentInput, Db};
+use crate::issue_enrichment::enrich_issue_message;
 use crate::providers::{adapter_for, ProviderParseState, ProviderStructuredEvent};
 use crate::telemetry::Telemetry;
 
@@ -103,6 +105,9 @@ struct SessionAlertCreatedEvent {
     severity: String,
     reason: String,
     message: String,
+    message_enriched: Option<String>,
+    message_enrichment_status: String,
+    message_enriched_at: Option<String>,
     requires_ack: bool,
     created_at: String,
 }
@@ -406,14 +411,6 @@ impl SessionSupervisor {
         db: Db,
         request: StartSessionRequest,
     ) -> Result<ManagedSession> {
-        if let Some(agent_id) = request.agent_id {
-            if let Ok(agent) = db.get_agent(agent_id).await {
-                if let Some(previous_session_id) = agent.active_session_id {
-                    let _ = self.stop_session(db.clone(), previous_session_id);
-                }
-            }
-        }
-
         let requested_provider = request
             .provider
             .clone()
@@ -995,6 +992,7 @@ fn handle_provider_parse_error(
     agent_id: Option<i64>,
     should_emit_alert: bool,
 ) {
+    let model_endpoint = app.state::<EchoConfig>().model_endpoint.clone();
     tauri::async_runtime::spawn(async move {
         let _ = db
             .insert_session_event(
@@ -1008,8 +1006,21 @@ fn handle_provider_parse_error(
             let severity = "warning".to_string();
             let reason = "unknown".to_string();
             let message = "Provider parse error; using fallback stream mode".to_string();
+            let enrichment = enrich_issue_message(&model_endpoint, &message).await;
             if let Ok(alert) = db
-                .create_session_alert(session_id, agent_id, &severity, &reason, &message, false)
+                .create_session_alert_with_enrichment(
+                    session_id,
+                    agent_id,
+                    &severity,
+                    &reason,
+                    &message,
+                    false,
+                    AlertEnrichmentInput {
+                        message_enriched: enrichment.cleaned.clone(),
+                        message_enrichment_status: Some(enrichment.status.clone()),
+                        message_enrichment_error: enrichment.error.clone(),
+                    },
+                )
                 .await
             {
                 let _ = app.emit(
@@ -1021,6 +1032,9 @@ fn handle_provider_parse_error(
                         severity,
                         reason,
                         message,
+                        message_enriched: alert.message_enriched.clone(),
+                        message_enrichment_status: alert.message_enrichment_status.clone(),
+                        message_enriched_at: alert.message_enriched_at.clone(),
                         requires_ack: false,
                         created_at: alert.created_at,
                     },
@@ -1037,6 +1051,7 @@ fn handle_provider_structured_event(
     session_id: i64,
     agent_id: Option<i64>,
 ) {
+    let model_endpoint = app.state::<EchoConfig>().model_endpoint.clone();
     match event {
         ProviderStructuredEvent::InputRequired {
             severity,
@@ -1063,14 +1078,20 @@ fn handle_provider_structured_event(
                 let _ = db
                     .mark_session_needs_input(session_id, &reason, &message)
                     .await;
+                let enrichment = enrich_issue_message(&model_endpoint, &message).await;
                 if let Ok(alert) = db
-                    .create_session_alert(
+                    .create_session_alert_with_enrichment(
                         session_id,
                         agent_id,
                         &severity,
                         &reason,
                         &message,
                         requires_ack,
+                        AlertEnrichmentInput {
+                            message_enriched: enrichment.cleaned.clone(),
+                            message_enrichment_status: Some(enrichment.status.clone()),
+                            message_enrichment_error: enrichment.error.clone(),
+                        },
                     )
                     .await
                 {
@@ -1083,6 +1104,9 @@ fn handle_provider_structured_event(
                             severity: alert.severity.clone(),
                             reason: alert.reason.clone(),
                             message: alert.message.clone(),
+                            message_enriched: alert.message_enriched.clone(),
+                            message_enrichment_status: alert.message_enrichment_status.clone(),
+                            message_enriched_at: alert.message_enriched_at.clone(),
                             requires_ack: alert.requires_ack,
                             created_at: alert.created_at.clone(),
                         },
@@ -1241,7 +1265,7 @@ async fn emit_runtime_events(app: &AppHandle, db: &Db, session_id: i64) {
                     "agent_runtime_updated",
                     AgentRuntimeUpdatedEvent {
                         agent_id,
-                        active_session_id: Some(session_id),
+                        active_session_id: agent.active_session_id,
                         status: session.status,
                         attention_state: agent.attention_state.clone(),
                         last_activity_at: session.last_activity_at,

@@ -171,6 +171,158 @@ async fn delete_managed_session_clears_agent_link_and_cascades_rows() {
 }
 
 #[tokio::test]
+async fn multiple_open_sessions_can_coexist_for_same_agent() {
+    let db = setup_test_db().await;
+    let agent = db
+        .create_agent("Agent Multi", Some("opencode"), None, None)
+        .await
+        .unwrap();
+
+    let first = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.update_session_status(first.id, "active", None)
+        .await
+        .unwrap();
+
+    let second = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.update_session_status(second.id, "active", None)
+        .await
+        .unwrap();
+
+    let sessions = db.list_managed_sessions(None, Some(20)).await.unwrap();
+    let open_for_agent = sessions
+        .iter()
+        .filter(|row| {
+            row.agent_id == Some(agent.id)
+                && matches!(
+                    row.status.as_str(),
+                    "waking" | "active" | "stalled" | "needs_input"
+                )
+        })
+        .count();
+    assert_eq!(open_for_agent, 2);
+}
+
+#[tokio::test]
+async fn end_session_if_open_repoints_active_session_id_to_latest_open_session() {
+    let db = setup_test_db().await;
+    let agent = db
+        .create_agent("Agent Repoint End", Some("opencode"), None, None)
+        .await
+        .unwrap();
+
+    let first = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.update_session_status(first.id, "active", None)
+        .await
+        .unwrap();
+
+    let second = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.update_session_status(second.id, "active", None)
+        .await
+        .unwrap();
+
+    let ended = db
+        .end_session_if_open(second.id, Some("stop"))
+        .await
+        .unwrap();
+    assert!(ended);
+
+    let agents = db.list_agents().await.unwrap();
+    let stored = agents.iter().find(|row| row.id == agent.id).unwrap();
+    assert_eq!(stored.active_session_id, Some(first.id));
+}
+
+#[tokio::test]
+async fn delete_managed_session_repoints_active_session_id_to_latest_open_session() {
+    let db = setup_test_db().await;
+    let agent = db
+        .create_agent("Agent Repoint Delete", Some("opencode"), None, None)
+        .await
+        .unwrap();
+
+    let first = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.update_session_status(first.id, "active", None)
+        .await
+        .unwrap();
+
+    let second = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.update_session_status(second.id, "active", None)
+        .await
+        .unwrap();
+
+    db.delete_managed_session(second.id).await.unwrap();
+
+    let agents = db.list_agents().await.unwrap();
+    let stored = agents.iter().find(|row| row.id == agent.id).unwrap();
+    assert_eq!(stored.active_session_id, Some(first.id));
+}
+
+#[tokio::test]
 async fn terminal_attach_detach_updates_attach_count() {
     let db = setup_test_db().await;
     let session = db
@@ -303,6 +455,8 @@ async fn session_alert_ack_and_resolve_flow() {
     assert!(alert.snoozed_until.is_none());
     assert_eq!(alert.escalation_count, 0);
     assert!(alert.resolved_at.is_none());
+    assert_eq!(alert.message_enrichment_status, "pending");
+    assert!(alert.message_enriched.is_none());
 
     let unresolved = db
         .list_unresolved_session_alerts(Some(agent.id), Some(10))
@@ -392,6 +546,52 @@ async fn create_session_alert_infers_agent_and_deduplicates_open_alerts() {
         .filter(|event| event.event_type == "session_alert_upserted")
         .count();
     assert_eq!(persisted_events, 2);
+}
+
+#[tokio::test]
+async fn create_session_alert_with_enrichment_persists_cleaned_message() {
+    let db = setup_test_db().await;
+    let agent = db
+        .create_agent("Agent Enrichment", Some("opencode"), None, None)
+        .await
+        .unwrap();
+    let session = db
+        .create_managed_session(
+            "opencode",
+            "opencode",
+            "[]",
+            None,
+            Some(agent.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let alert = db
+        .create_session_alert_with_enrichment(
+            session.id,
+            Some(agent.id),
+            "warning",
+            "input_prompt",
+            "raw prompt text",
+            true,
+            crate::db::AlertEnrichmentInput {
+                message_enriched: Some("cleaned prompt text".to_string()),
+                message_enrichment_status: Some("success".to_string()),
+                message_enrichment_error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        alert.message_enriched.as_deref(),
+        Some("cleaned prompt text")
+    );
+    assert_eq!(alert.message_enrichment_status, "success");
+    assert!(alert.message_enriched_at.is_some());
+    assert!(alert.message_enrichment_error.is_none());
 }
 
 #[tokio::test]
@@ -545,6 +745,58 @@ async fn session_needs_input_promotes_attention_state_without_alerts() {
 }
 
 #[tokio::test]
+async fn runtime_issue_report_dismiss_and_clear_flow() {
+    let db = setup_test_db().await;
+
+    let first = db
+        .report_runtime_issue(
+            "model_down",
+            "system",
+            "raw model endpoint error",
+            Some("Model endpoint unavailable"),
+            "success",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.seen_count, 1);
+    assert_eq!(
+        first.enriched_message.as_deref(),
+        Some("Model endpoint unavailable")
+    );
+
+    let second = db
+        .report_runtime_issue(
+            "model_down",
+            "system",
+            "raw model endpoint error 2",
+            None,
+            "failed",
+            Some("timeout"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.seen_count, 2);
+    assert_eq!(second.enrichment_status, "failed");
+
+    let visible = db.list_visible_runtime_issues(Some(10)).await.unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].kind, "model_down");
+
+    let dismissed = db
+        .dismiss_runtime_issue("model_down", 120_000)
+        .await
+        .unwrap();
+    assert!(dismissed.dismissed_until.is_some());
+    let hidden = db.list_visible_runtime_issues(Some(10)).await.unwrap();
+    assert!(hidden.is_empty());
+
+    db.clear_runtime_issue("model_down").await.unwrap();
+    let cleared = db.get_runtime_issue("model_down").await.unwrap();
+    assert!(cleared.resolved_at.is_some());
+}
+
+#[tokio::test]
 async fn connect_upgrades_legacy_schema_with_phase1_defaults() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("legacy.sqlite");
@@ -609,4 +861,31 @@ async fn connect_upgrades_legacy_schema_with_phase1_defaults() {
     assert!(!session.needs_input);
     assert_eq!(session.transport, "pty");
     assert!(session.last_activity_at.is_some());
+
+    let alert = upgraded
+        .create_session_alert(
+            session.id,
+            Some(agent.id),
+            "warning",
+            "input_prompt",
+            "Legacy schema alert",
+            true,
+        )
+        .await
+        .expect("alert after upgrade");
+    assert_eq!(alert.message_enrichment_status, "pending");
+    assert!(alert.message_enriched.is_none());
+
+    let runtime_issue = upgraded
+        .report_runtime_issue(
+            "adapter_down",
+            "system",
+            "legacy runtime error",
+            None,
+            "failed",
+            Some("unavailable"),
+        )
+        .await
+        .expect("runtime issue after upgrade");
+    assert_eq!(runtime_issue.kind, "adapter_down");
 }

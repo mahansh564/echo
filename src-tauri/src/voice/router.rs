@@ -653,7 +653,13 @@ fn find_session_for_agent(agent: &Agent, sessions: &[ManagedSession]) -> Option<
     if let Some(active_session_id) = agent.active_session_id {
         if let Some(session) = sessions
             .iter()
-            .find(|entry| entry.id == active_session_id)
+            .find(|entry| {
+                entry.id == active_session_id
+                    && matches!(
+                        entry.status.as_str(),
+                        "waking" | "active" | "stalled" | "needs_input"
+                    )
+            })
             .cloned()
         {
             return Some(session);

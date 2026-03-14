@@ -62,7 +62,7 @@ Expected:
 4. Detach/attach repeatedly during the transition.
 
 Expected:
-- Exactly one active session persists for the agent.
+- Multiple active sessions can coexist for the same agent.
 - Attach errors only when runtime is unavailable and recover on retry.
 - `attach_count` stays consistent and returns to `0` on full detach/end.
 

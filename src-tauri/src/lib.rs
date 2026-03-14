@@ -6,6 +6,7 @@ pub mod commands;
 pub mod config;
 pub mod core;
 pub mod db;
+pub mod issue_enrichment;
 pub mod linear;
 pub mod providers;
 pub mod telemetry;
@@ -54,6 +55,10 @@ pub fn run() {
             commands::alerts::resolve_session_alert_cmd,
             commands::alerts::snooze_session_alert_cmd,
             commands::alerts::escalate_session_alert_cmd,
+            commands::runtime_issues::report_runtime_issue_cmd,
+            commands::runtime_issues::list_runtime_issues_cmd,
+            commands::runtime_issues::dismiss_runtime_issue_cmd,
+            commands::runtime_issues::clear_runtime_issue_cmd,
             commands::agents::create_agent_cmd,
             commands::agents::assign_agent_to_task_cmd,
             commands::agents::list_agents_cmd,

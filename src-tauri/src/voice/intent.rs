@@ -9,6 +9,7 @@ pub const ACTION_STOP_SESSION: &str = "stop_session";
 pub const ACTION_ATTACH_AGENT: &str = "attach_agent";
 pub const ACTION_SEND_INPUT: &str = "send_input";
 pub const ACTION_LIST_INPUT_NEEDED: &str = "list_input_needed";
+pub const ACTION_CREATE_AGENT: &str = "create_agent";
 pub const ACTION_UNKNOWN: &str = "unknown";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -46,7 +47,7 @@ async fn parse_intent_with_llm(model_endpoint: &str, input: &str) -> Result<Inte
     };
 
     let prompt = format!(
-        "Extract one command from this transcript. Return only JSON as {{\"action\": string, \"payload\": object}}.\nAllowed actions: status_overview, status_agent, start_session, stop_session, attach_agent, send_input, list_input_needed, unknown.\nPayload contracts:\n- status_overview: {{\"confirmed\": boolean}}\n- status_agent: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"query\": string, \"confirmed\": boolean}}\n- start_session: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"command\": string|null, \"args\": string[], \"cwd\": string|null, \"confirmed\": boolean}}\n- stop_session: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"confirmed\": boolean}}\n- attach_agent: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"confirmed\": boolean}}\n- send_input: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"input\": string, \"confirmed\": boolean}}\n- list_input_needed: {{\"confirmed\": boolean}}\nTranscript: {}",
+        "Extract one command from this transcript. Return only JSON as {{\"action\": string, \"payload\": object}}.\nAllowed actions: status_overview, status_agent, start_session, stop_session, attach_agent, send_input, list_input_needed, create_agent, unknown.\nPayload contracts:\n- status_overview: {{\"confirmed\": boolean}}\n- status_agent: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"query\": string, \"confirmed\": boolean}}\n- start_session: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"command\": string|null, \"args\": string[], \"cwd\": string|null, \"confirmed\": boolean}}\n- stop_session: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"confirmed\": boolean}}\n- attach_agent: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"confirmed\": boolean}}\n- send_input: {{\"agent_index\": number|null, \"agent_name_hint\": string|null, \"input\": string, \"confirmed\": boolean}}\n- list_input_needed: {{\"confirmed\": boolean}}\n- create_agent: {{\"name\": string|null, \"confirmed\": boolean}}\nTranscript: {}",
         input
     );
 
@@ -188,6 +189,16 @@ fn parse_with_rules(input: &str) -> IntentCommand {
         };
     }
 
+    if is_create_agent_request(&normalized_without_confirmation) {
+        return IntentCommand {
+            action: ACTION_CREATE_AGENT.to_string(),
+            payload: serde_json::json!({
+                "name": parse_create_agent_name(trimmed),
+                "confirmed": confirmed,
+            }),
+        };
+    }
+
     IntentCommand {
         action: ACTION_UNKNOWN.to_string(),
         payload: serde_json::json!({ "raw": input }),
@@ -203,7 +214,8 @@ fn normalize_llm_intent(intent: IntentCommand, input: &str) -> IntentCommand {
         | ACTION_STOP_SESSION
         | ACTION_ATTACH_AGENT
         | ACTION_SEND_INPUT
-        | ACTION_LIST_INPUT_NEEDED => normalize_payload_for_action(&action, intent.payload, input),
+        | ACTION_LIST_INPUT_NEEDED
+        | ACTION_CREATE_AGENT => normalize_payload_for_action(&action, intent.payload, input),
         "query_agent_status" => {
             let query = intent
                 .payload
@@ -281,6 +293,14 @@ fn normalize_payload_for_action(action: &str, payload: Value, input: &str) -> In
             "agent_index": agent_index,
             "agent_name_hint": agent_name_hint,
             "input": payload.get("input").and_then(|value| value.as_str()).unwrap_or(""),
+            "confirmed": confirmed,
+        }),
+        ACTION_CREATE_AGENT => serde_json::json!({
+            "name": payload
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty()),
             "confirmed": confirmed,
         }),
         _ => serde_json::json!({ "raw": input }),
@@ -412,6 +432,39 @@ fn parse_start_session_command(original: &str) -> Value {
         }
     }
     Value::Null
+}
+
+fn is_create_agent_request(normalized: &str) -> bool {
+    let create_phrases = [
+        "new agent",
+        "create agent",
+        "add agent",
+        "spawn agent",
+        "open a new chat",
+        "open new chat",
+        "new chat",
+        "create chat",
+        "start a new chat",
+    ];
+    create_phrases
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+}
+
+fn parse_create_agent_name(original: &str) -> Option<String> {
+    let lower = original.to_lowercase();
+    let markers = [" named ", " called ", " name "];
+
+    for marker in markers {
+        if let Some(idx) = lower.find(marker) {
+            let name = original[idx + marker.len()..].trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -567,5 +620,29 @@ mod tests {
             .await
             .expect("intent");
         assert_eq!(intent.action, ACTION_LIST_INPUT_NEEDED);
+    }
+
+    #[tokio::test]
+    async fn fallback_rule_for_open_new_chat() {
+        let intent = parse_intent("http://localhost:9", "open a new chat")
+            .await
+            .expect("intent");
+        assert_eq!(intent.action, ACTION_CREATE_AGENT);
+        assert_eq!(
+            intent.payload.get("name").and_then(|value| value.as_str()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_rule_for_create_agent_named() {
+        let intent = parse_intent("http://localhost:9", "create agent named Atlas")
+            .await
+            .expect("intent");
+        assert_eq!(intent.action, ACTION_CREATE_AGENT);
+        assert_eq!(
+            intent.payload.get("name").and_then(|value| value.as_str()),
+            Some("Atlas")
+        );
     }
 }
