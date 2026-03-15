@@ -313,11 +313,13 @@ impl VoiceManager {
                 continue;
             }
 
-            if self
-                .set_state(&app, VoiceRuntimeState::WakeDetected)
-                .is_err()
-            {
-                break;
+            if let Err(err) = self.set_state(&app, VoiceRuntimeState::WakeDetected) {
+                let _ = self.emit_error(
+                    &app,
+                    format!("failed to update wake-detected state: {}", err),
+                );
+                let _ = self.set_state(&app, VoiceRuntimeState::Listening);
+                continue;
             }
 
             if let Some(inline_command) =
@@ -429,112 +431,127 @@ impl VoiceManager {
         config: &EchoConfig,
         transcript: String,
     ) -> Result<serde_json::Value> {
-        let text = transcript.trim().to_string();
-        if text.is_empty() {
-            self.set_state(app, VoiceRuntimeState::Listening)?;
-            return Err(anyhow!("empty transcript"));
-        }
+        let outcome = async {
+            let text = transcript.trim().to_string();
+            if text.is_empty() {
+                return Err(anyhow!("empty transcript"));
+            }
 
-        {
-            let mut inner = self.inner.lock().unwrap();
-            inner.last_transcript = Some(text.clone());
-        }
-        app.emit(
-            "voice_transcript",
-            VoiceTranscriptEvent { text: text.clone() },
-        )?;
+            {
+                let mut inner = self.inner.lock().unwrap();
+                inner.last_transcript = Some(text.clone());
+            }
+            app.emit(
+                "voice_transcript",
+                VoiceTranscriptEvent { text: text.clone() },
+            )?;
 
-        self.set_state(app, VoiceRuntimeState::Parsing)?;
+            self.set_state(app, VoiceRuntimeState::Parsing)?;
 
-        let parsed = intent::parse_intent(&config.model_endpoint, &text).await?;
-        app.emit(
-            "voice_intent",
-            VoiceIntentEvent {
-                action: parsed.action.clone(),
-                payload: parsed.payload.clone(),
-            },
-        )?;
+            let parsed = intent::parse_intent(&config.model_endpoint, &text).await?;
+            app.emit(
+                "voice_intent",
+                VoiceIntentEvent {
+                    action: parsed.action.clone(),
+                    payload: parsed.payload.clone(),
+                },
+            )?;
 
-        self.set_state(app, VoiceRuntimeState::Executing)?;
+            self.set_state(app, VoiceRuntimeState::Executing)?;
 
-        let execution =
-            router::execute_command(app, db, terminal, &config.model_endpoint, &parsed).await;
-        match execution {
-            Ok(result) => {
-                if should_emit_status_reply(&parsed.action, &result) {
-                    if let Some(raw_summary) = build_spoken_status_summary(&parsed.action, &result)
-                    {
-                        let summary =
-                            build_voice_summary_for_speech(&config.model_endpoint, &raw_summary)
-                                .await;
-                        if !summary.is_empty() {
-                            if let Err(err) = tts::speak(&summary) {
-                                self.emit_error(app, format!("tts failed: {}", err))?;
+            let execution =
+                router::execute_command(app, db, terminal, &config.model_endpoint, &parsed).await;
+            match execution {
+                Ok(result) => {
+                    if should_emit_status_reply(&parsed.action, &result) {
+                        if let Some(raw_summary) =
+                            build_spoken_status_summary(&parsed.action, &result)
+                        {
+                            let summary =
+                                build_voice_summary_for_speech(&config.model_endpoint, &raw_summary)
+                                    .await;
+                            if !summary.is_empty() {
+                                if let Err(err) = tts::speak(&summary) {
+                                    self.emit_error(app, format!("tts failed: {}", err))?;
+                                }
+                                app.emit(
+                                    "voice_status_reply",
+                                    VoiceStatusReplyEvent {
+                                        request_type: status_request_type(&parsed.action, &result),
+                                        target_agent_id: target_agent_id_from_result(&result),
+                                        summary,
+                                        at: now_timestamp(),
+                                    },
+                                )?;
                             }
-                            app.emit(
-                                "voice_status_reply",
-                                VoiceStatusReplyEvent {
-                                    request_type: status_request_type(&parsed.action, &result),
-                                    target_agent_id: target_agent_id_from_result(&result),
-                                    summary,
-                                    at: now_timestamp(),
-                                },
-                            )?;
                         }
                     }
+                    let execution_event = build_voice_action_executed_event(
+                        &parsed.action,
+                        &parsed.payload,
+                        &result,
+                        "ok",
+                    );
+                    app.emit("voice_action_executed", execution_event)?;
+                    record_voice_command_metric(
+                        app,
+                        &parsed.action,
+                        "ok",
+                        &parsed.payload,
+                        &result,
+                    );
+                    self.set_state(app, VoiceRuntimeState::Listening)?;
+                    Ok(result)
                 }
-                let execution_event = build_voice_action_executed_event(
-                    &parsed.action,
-                    &parsed.payload,
-                    &result,
-                    "ok",
-                );
-                app.emit("voice_action_executed", execution_event)?;
-                record_voice_command_metric(app, &parsed.action, "ok", &parsed.payload, &result);
-                self.set_state(app, VoiceRuntimeState::Listening)?;
-                Ok(result)
-            }
-            Err(err) => {
-                let err_text = err.to_string();
-                let error_result = serde_json::json!({ "error": err.to_string() });
-                let execution_event = build_voice_action_executed_event(
-                    &parsed.action,
-                    &parsed.payload,
-                    &error_result,
-                    "error",
-                );
-                app.emit("voice_action_executed", execution_event)?;
-                record_voice_command_metric(
-                    app,
-                    &parsed.action,
-                    "error",
-                    &parsed.payload,
-                    &error_result,
-                );
-                let spoken_error =
-                    build_voice_summary_for_speech(&config.model_endpoint, &err_text).await;
-                if !spoken_error.is_empty() {
-                    if let Err(tts_err) = tts::speak(&spoken_error) {
-                        self.emit_error(app, format!("tts failed: {}", tts_err))?;
+                Err(err) => {
+                    let err_text = err.to_string();
+                    let error_result = serde_json::json!({ "error": err.to_string() });
+                    let execution_event = build_voice_action_executed_event(
+                        &parsed.action,
+                        &parsed.payload,
+                        &error_result,
+                        "error",
+                    );
+                    app.emit("voice_action_executed", execution_event)?;
+                    record_voice_command_metric(
+                        app,
+                        &parsed.action,
+                        "error",
+                        &parsed.payload,
+                        &error_result,
+                    );
+                    let spoken_error =
+                        build_voice_summary_for_speech(&config.model_endpoint, &err_text).await;
+                    if !spoken_error.is_empty() {
+                        if let Err(tts_err) = tts::speak(&spoken_error) {
+                            self.emit_error(app, format!("tts failed: {}", tts_err))?;
+                        }
+                        app.emit(
+                            "voice_status_reply",
+                            VoiceStatusReplyEvent {
+                                request_type: "error".to_string(),
+                                target_agent_id: target_agent_id_from_result(&error_result),
+                                summary: spoken_error,
+                                at: now_timestamp(),
+                            },
+                        )?;
                     }
-                    app.emit(
-                        "voice_status_reply",
-                        VoiceStatusReplyEvent {
-                            request_type: "error".to_string(),
-                            target_agent_id: target_agent_id_from_result(&error_result),
-                            summary: spoken_error,
-                            at: now_timestamp(),
-                        },
+                    self.emit_error(
+                        app,
+                        sanitize_display_text(&err_text, VOICE_SUMMARY_MAX_CHARS),
                     )?;
+                    self.set_state(app, VoiceRuntimeState::Listening)?;
+                    Err(err)
                 }
-                self.emit_error(
-                    app,
-                    sanitize_display_text(&err_text, VOICE_SUMMARY_MAX_CHARS),
-                )?;
-                self.set_state(app, VoiceRuntimeState::Listening)?;
-                Err(err)
             }
         }
+        .await;
+
+        if outcome.is_err() {
+            let _ = self.set_state(app, VoiceRuntimeState::Listening);
+        }
+
+        outcome
     }
 
     async fn capture_command_transcript(&self, config: &EchoConfig) -> Result<String> {
