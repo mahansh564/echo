@@ -467,9 +467,11 @@ impl VoiceManager {
                         if let Some(raw_summary) =
                             build_spoken_status_summary(&parsed.action, &result)
                         {
-                            let summary =
-                                build_voice_summary_for_speech(&config.model_endpoint, &raw_summary)
-                                    .await;
+                            let summary = build_voice_summary_for_speech(
+                                &config.model_endpoint,
+                                &raw_summary,
+                            )
+                            .await;
                             if !summary.is_empty() {
                                 if let Err(err) = tts::speak(&summary) {
                                     self.emit_error(app, format!("tts failed: {}", err))?;

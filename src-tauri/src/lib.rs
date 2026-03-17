@@ -9,6 +9,7 @@ pub mod db;
 pub mod issue_enrichment;
 pub mod linear;
 pub mod providers;
+pub mod shell;
 pub mod telemetry;
 pub mod terminal;
 pub mod voice;
@@ -36,11 +37,15 @@ pub fn run() {
             let _ = tauri::async_runtime::block_on(terminal.reconcile_orphan_sessions(&db_state));
             app.manage(terminal.clone());
             let config = config::load_config()?;
+            let initial_mode = config.app_mode;
+            app.manage(shell::AppShellState::new(initial_mode));
             let voice = VoiceManager::new();
             let db_state = app.state::<db::Db>().inner().clone();
             let _ = voice.start(app.handle(), &config, db_state, terminal.clone());
             app.manage(config);
             app.manage(voice);
+            shell::setup_tray(app.handle())?;
+            let _ = shell::apply_app_mode(app.handle(), initial_mode)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -75,6 +80,7 @@ pub fn run() {
             commands::terminal::send_terminal_data_cmd,
             commands::terminal::attach_terminal_session_cmd,
             commands::terminal::detach_terminal_session_cmd,
+            commands::shell::set_app_mode_cmd,
             commands::voice::voice_status_cmd,
             commands::voice::process_voice_text_cmd,
             commands::voice::push_to_talk_cmd,

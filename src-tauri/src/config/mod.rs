@@ -2,8 +2,31 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AppMode {
+    Full,
+    Zen,
+}
+
+impl Default for AppMode {
+    fn default() -> Self {
+        Self::Full
+    }
+}
+
+impl AppMode {
+    fn from_config_value(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "zen" => Self::Zen,
+            _ => Self::Full,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EchoConfig {
+    pub app_mode: AppMode,
     pub mic_device: String,
     pub hotkey: String,
     pub model_endpoint: String,
@@ -27,6 +50,7 @@ pub struct EchoConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PartialConfig {
+    pub app_mode: Option<String>,
     pub mic_device: Option<String>,
     pub hotkey: Option<String>,
     pub model_endpoint: Option<String>,
@@ -51,6 +75,7 @@ impl Default for EchoConfig {
     fn default() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         Self {
+            app_mode: AppMode::Full,
             mic_device: ":1".to_string(),
             hotkey: "cmd+shift+space".to_string(),
             model_endpoint: "http://localhost:11434".to_string(),
@@ -79,6 +104,9 @@ pub fn load_config() -> Result<EchoConfig> {
         if path.exists() {
             let contents = std::fs::read_to_string(path)?;
             let partial: PartialConfig = toml::from_str(&contents)?;
+            if let Some(value) = partial.app_mode {
+                config.app_mode = AppMode::from_config_value(&value);
+            }
             if let Some(value) = partial.mic_device {
                 config.mic_device = value;
             }
@@ -139,11 +167,30 @@ pub fn load_config() -> Result<EchoConfig> {
     Ok(config)
 }
 
+pub fn set_app_mode(mode: AppMode) -> Result<EchoConfig> {
+    let mut config = load_config()?;
+    config.app_mode = mode;
+    save_config(&config)?;
+    Ok(config)
+}
+
 fn user_config_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(dirs::home_dir)?;
     Some(home.join(".echo").join("config.toml"))
+}
+
+fn save_config(config: &EchoConfig) -> Result<()> {
+    let Some(path) = user_config_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let encoded = toml::to_string_pretty(config)?;
+    std::fs::write(path, encoded)?;
+    Ok(())
 }
 
 #[cfg(test)]

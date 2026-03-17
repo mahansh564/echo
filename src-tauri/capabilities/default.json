@@ -19,5 +19,16 @@
       "core:default",
       "opener:default"
     ]
+  },
+  {
+    "identifier": "zen-panel",
+    "description": "Capability for zen panel window",
+    "windows": ["zen-panel"],
+    "permissions": [
+      "core:default",
+      "opener:default",
+      "core:webview:allow-create-webview-window",
+      "core:window:allow-create"
+    ]
   }
 ]
