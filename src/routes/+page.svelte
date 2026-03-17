@@ -240,7 +240,11 @@
 
   type UnlistenFn = () => void;
 
-  type PaletteCommandId = "show-unresolved-inputs" | "voice-query-input-needed";
+  type PaletteCommandId =
+    | "show-unresolved-inputs"
+    | "voice-query-input-needed"
+    | "switch-mode-zen"
+    | "switch-mode-full";
 
   type PaletteCommand = {
     id: PaletteCommandId;
@@ -281,6 +285,16 @@
       id: "voice-query-input-needed",
       label: "Ask voice: which agents need input",
       meta: "Runs the voice query for unresolved input requests"
+    },
+    {
+      id: "switch-mode-zen",
+      label: "Switch to Zen mode",
+      meta: "Hide dashboard and move to menubar-focused workflow"
+    },
+    {
+      id: "switch-mode-full",
+      label: "Switch to Full mode",
+      meta: "Show dashboard mode as the primary app window"
     }
   ];
 
@@ -1058,6 +1072,14 @@
       case "voice-query-input-needed":
         closeCommandPalette();
         await runVoiceText("which agents need input");
+        break;
+      case "switch-mode-zen":
+        closeCommandPalette();
+        await invoke("set_app_mode_cmd", { mode: "zen" });
+        break;
+      case "switch-mode-full":
+        closeCommandPalette();
+        await invoke("set_app_mode_cmd", { mode: "full" });
         break;
       default:
         break;
