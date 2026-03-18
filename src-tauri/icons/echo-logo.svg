@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="160" y1="120" x2="864" y2="920" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="0.55" stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#0b1020"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="286" y1="340" x2="738" y2="708" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <filter id="softGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="5"/>
+    </filter>
+  </defs>
+
+  <rect x="96" y="96" width="832" height="832" rx="220" fill="url(#bg)"/>
+
+  <circle cx="512" cy="512" r="274" fill="none" stroke="#0ea5b7" stroke-opacity="0.22" stroke-width="56"/>
+  <circle cx="512" cy="512" r="336" fill="none" stroke="#22d3ee" stroke-opacity="0.12" stroke-width="24"/>
+
+  <path
+    d="M288 510c44 0 44-132 88-132s44 268 88 268 44-290 88-290 44 198 88 198 44-44 88-44"
+    fill="none"
+    stroke="url(#wave)"
+    stroke-width="56"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    filter="url(#softGlow)"
+  />
+  <path
+    d="M288 510c44 0 44-132 88-132s44 268 88 268 44-290 88-290 44 198 88 198 44-44 88-44"
+    fill="none"
+    stroke="#e6fbff"
+    stroke-opacity="0.9"
+    stroke-width="36"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>
