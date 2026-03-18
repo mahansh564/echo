@@ -329,6 +329,7 @@
   let terminalDataListener: { dispose: () => void } | null = null;
   let terminalFlushRaf = 0;
   let terminalCursorPersistTimer = 0;
+  let inputRequestRefreshTimer = 0;
   let listenerReconnectTimer = 0;
   let listenerReconnectAttempts = 0;
   let listenerLifecycleStopped = false;
@@ -351,6 +352,7 @@
   const TERMINAL_CURSOR_STORAGE_KEY = "echo.main.terminal-cursors.v1";
   const SELECTED_SESSION_STORAGE_KEY = "echo.main.selected-session.v1";
   const TERMINAL_CURSOR_PERSIST_DEBOUNCE_MS = 250;
+  const INPUT_REQUEST_REFRESH_DEBOUNCE_MS = 300;
   const LISTENER_RECONNECT_BASE_MS = 1000;
   const LISTENER_RECONNECT_MAX_MS = 15000;
   const ALERT_TOAST_MAX = 4;
@@ -446,8 +448,20 @@
     })
   );
 
+  const needsInputSessionIds = $derived.by(() => {
+    const ids = new Set<number>();
+    for (const session of sessions) {
+      if (session.needsInput || session.status === "needs_input") {
+        ids.add(session.id);
+      }
+    }
+    return ids;
+  });
+
   const visibleInputRequests = $derived(
-    unresolvedAlerts.filter((alert) => !alert.acknowledgedAt)
+    unresolvedAlerts.filter(
+      (alert) => !alert.acknowledgedAt && needsInputSessionIds.has(alert.sessionId)
+    )
   );
 
   const activeRuntimeIssues = $derived.by(() =>
@@ -706,6 +720,15 @@
       terminalCursorPersistTimer = 0;
       persistTerminalCursors();
     }, TERMINAL_CURSOR_PERSIST_DEBOUNCE_MS);
+  }
+
+  function scheduleInputRequestRefresh() {
+    if (typeof window === "undefined") return;
+    if (inputRequestRefreshTimer) return;
+    inputRequestRefreshTimer = window.setTimeout(() => {
+      inputRequestRefreshTimer = 0;
+      void loadData({ background: true });
+    }, INPUT_REQUEST_REFRESH_DEBOUNCE_MS);
   }
 
   const listenerReconnectDelayMs = (attempt: number) =>
@@ -1403,6 +1426,7 @@
       });
       terminalInput = "";
       await streamTerminalChunks(selectedSessionId);
+      await loadData({ background: true });
     } catch (error) {
       console.error("Failed to send terminal input", error);
     }
@@ -1486,6 +1510,7 @@
         }).catch((error) => {
           console.error("Failed to send raw terminal data", error);
         });
+        scheduleInputRequestRefresh();
       });
 
       await tick();
@@ -1753,6 +1778,10 @@
       if (terminalCursorPersistTimer) {
         window.clearTimeout(terminalCursorPersistTimer);
         terminalCursorPersistTimer = 0;
+      }
+      if (inputRequestRefreshTimer) {
+        window.clearTimeout(inputRequestRefreshTimer);
+        inputRequestRefreshTimer = 0;
       }
       persistTerminalCursors();
       if (terminalFlushRaf) {

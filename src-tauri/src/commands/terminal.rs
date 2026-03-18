@@ -1,3 +1,4 @@
+use crate::commands::emit_agent_updated;
 use crate::db::models::{ManagedSession, SessionEvent, StartSessionRequest};
 use crate::db::Db;
 use crate::telemetry::Telemetry;
@@ -188,6 +189,7 @@ pub async fn resize_terminal_cmd(
 
 #[tauri::command]
 pub async fn send_terminal_input_cmd(
+    app: tauri::AppHandle,
     terminal: tauri::State<'_, TerminalManager>,
     db: tauri::State<'_, Db>,
     session_id: i64,
@@ -207,11 +209,17 @@ pub async fn send_terminal_input_cmd(
     db.clear_session_needs_input(session_id)
         .await
         .map_err(|e| e.to_string())?;
+    if let Ok(session) = db.get_managed_session(session_id).await {
+        if let Some(agent_id) = session.agent_id {
+            let _ = emit_agent_updated(&app, agent_id);
+        }
+    }
     Ok(())
 }
 
 #[tauri::command]
 pub async fn send_terminal_data_cmd(
+    app: tauri::AppHandle,
     terminal: tauri::State<'_, TerminalManager>,
     db: tauri::State<'_, Db>,
     session_id: i64,
@@ -223,6 +231,11 @@ pub async fn send_terminal_data_cmd(
     db.clear_session_needs_input(session_id)
         .await
         .map_err(|e| e.to_string())?;
+    if let Ok(session) = db.get_managed_session(session_id).await {
+        if let Some(agent_id) = session.agent_id {
+            let _ = emit_agent_updated(&app, agent_id);
+        }
+    }
     Ok(())
 }
 
