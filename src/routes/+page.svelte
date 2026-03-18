@@ -458,11 +458,37 @@
     return ids;
   });
 
-  const visibleInputRequests = $derived(
-    unresolvedAlerts.filter(
-      (alert) => !alert.acknowledgedAt && needsInputSessionIds.has(alert.sessionId)
-    )
-  );
+  const visibleInputRequests = $derived.by(() => {
+    const latestBySession = new Map<number, SessionAlert>();
+    for (const alert of unresolvedAlerts) {
+      if (alert.acknowledgedAt || !needsInputSessionIds.has(alert.sessionId)) {
+        continue;
+      }
+      const existing = latestBySession.get(alert.sessionId);
+      if (!existing) {
+        latestBySession.set(alert.sessionId, alert);
+        continue;
+      }
+
+      const nextTime = Date.parse(alert.updatedAt || alert.createdAt);
+      const existingTime = Date.parse(existing.updatedAt || existing.createdAt);
+      if (
+        Number.isNaN(existingTime) ||
+        (!Number.isNaN(nextTime) && nextTime >= existingTime)
+      ) {
+        latestBySession.set(alert.sessionId, alert);
+      }
+    }
+
+    return [...latestBySession.values()].sort((left, right) => {
+      const leftTime = Date.parse(left.updatedAt || left.createdAt);
+      const rightTime = Date.parse(right.updatedAt || right.createdAt);
+      if (Number.isNaN(leftTime) && Number.isNaN(rightTime)) return right.id - left.id;
+      if (Number.isNaN(leftTime)) return 1;
+      if (Number.isNaN(rightTime)) return -1;
+      return rightTime - leftTime;
+    });
+  });
 
   const activeRuntimeIssues = $derived.by(() =>
     runtimeIssueRecords
