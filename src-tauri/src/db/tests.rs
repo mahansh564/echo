@@ -71,7 +71,7 @@ async fn managed_session_lifecycle_persists() {
     let stored = db.get_managed_session(session.id).await.unwrap();
     assert_eq!(stored.status, "active");
     assert!(!stored.needs_input);
-    assert_eq!(stored.transport, "pty");
+    assert_eq!(stored.transport, "tmux");
 
     let events = db.list_session_events(session.id, Some(10)).await.unwrap();
     assert!(!events.is_empty());
