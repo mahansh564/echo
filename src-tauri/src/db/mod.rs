@@ -317,7 +317,7 @@ impl Db {
     ) -> Result<ManagedSession> {
         let mut conn = self.pool.acquire().await?;
         sqlx::query(
-            "INSERT INTO managed_sessions (provider, status, launch_command, launch_args_json, cwd, agent_id, task_id, metadata_json) VALUES (?, 'waking', ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO managed_sessions (provider, status, launch_command, launch_args_json, cwd, agent_id, task_id, metadata_json, transport) VALUES (?, 'waking', ?, ?, ?, ?, ?, ?, 'tmux')",
         )
         .bind(provider)
         .bind(launch_command)
@@ -347,6 +347,24 @@ impl Db {
         }
 
         Ok(session)
+    }
+
+    pub async fn update_session_metadata(
+        &self,
+        session_id: i64,
+        metadata_json: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE managed_sessions
+             SET metadata_json = ?,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(metadata_json)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn update_session_status(
@@ -590,7 +608,7 @@ impl Db {
         )
         .bind(session_id)
         .bind(Some("terminal attached"))
-        .bind(Some(serde_json::json!({ "transport": "pty" }).to_string()))
+        .bind(Some(serde_json::json!({ "transport": "tmux" }).to_string()))
         .execute(&mut *conn)
         .await?;
 
@@ -622,7 +640,7 @@ impl Db {
         )
         .bind(session_id)
         .bind(Some("terminal detached"))
-        .bind(Some(serde_json::json!({ "transport": "pty" }).to_string()))
+        .bind(Some(serde_json::json!({ "transport": "tmux" }).to_string()))
         .execute(&mut *conn)
         .await?;
 

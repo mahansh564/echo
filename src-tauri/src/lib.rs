@@ -34,7 +34,9 @@ pub fn run() {
             app.manage(Telemetry::new());
             let terminal = TerminalManager::new();
             let db_state = app.state::<db::Db>().inner().clone();
-            let _ = tauri::async_runtime::block_on(terminal.reconcile_orphan_sessions(&db_state));
+            let _ = tauri::async_runtime::block_on(
+                terminal.reconcile_orphan_sessions_with_app(&app.handle(), &db_state),
+            );
             app.manage(terminal.clone());
             let config = config::load_config()?;
             let initial_mode = config.app_mode;
